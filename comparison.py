@@ -16,12 +16,24 @@ def data_of(payload):
 
 
 def parse_cart(payload):
-    if payload.get("success") is not True and payload.get("successful") is not True:
+    if not isinstance(payload, dict):
+        raise AppError("Cart response was not recognized.", 502)
+    if payload.get("success") is False or payload.get("successful") is False:
+        raise AppError("Cart state could not be confirmed.", 502)
+    if "statusCode" in payload and payload["statusCode"] != 0:
         raise AppError("Cart state could not be confirmed.", 502)
     if "data" not in payload:
         raise AppError("Cart response is missing data. Nothing was cleared.", 502)
     data = payload["data"]
     cart = data.get("data", data) if isinstance(data, dict) else data
+    confirmed = payload.get("success") is True or payload.get("successful") is True
+    # Observed populated gateway format: statusCode=0, data.result=success.
+    confirmed = confirmed or (
+        type(payload.get("statusCode")) is int and payload["statusCode"] == 0
+        and isinstance(cart, dict) and cart.get("result") == "success"
+    )
+    if not confirmed:
+        raise AppError("Cart state could not be confirmed.", 502)
     if cart is None:
         return None
     if isinstance(cart, dict) and isinstance(cart.get("items"), list):
@@ -30,10 +42,18 @@ def parse_cart(payload):
 
 
 def exact_basket(cart, offer):
-    if not isinstance(cart, dict) or str((cart.get("restaurant") or {}).get("id", "")) != offer["restaurant_id"]:
+    if not isinstance(cart, dict):
         return False
+    restaurant = cart.get("restaurant") or {}
+    if not isinstance(restaurant, dict):
+        return False
+    actual_restaurant_id = restaurant.get("id") or cart.get("restaurant_id")
+    if actual_restaurant_id is not None and str(actual_restaurant_id) != offer["restaurant_id"]:
+        return False
+    # The observed gateway response omits restaurant.id. Match the exact
+    # menu item ID from the scoped restaurant request instead of a subtitle.
     items = cart.get("items")
-    if not isinstance(items, list) or len(items) != 1:
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
         return False
     item = items[0]
     return (str(item.get("menu_item_id", "")) == offer["item_id"]
@@ -58,7 +78,10 @@ def read_bill(offer, cart):
             "item_total": number(pricing.get("item_total")),
             "delivery": number(pricing.get("delivery_charge")),
             "other_charges": number(pricing.get("taxes_and_charges")),
-            "discount": discount if confirmed else 0, "coupon": code if confirmed else None}
+            "discount": discount if confirmed else 0, "coupon": code if confirmed else None,
+            "free_delivery_applied": coupons.get("free_delivery_applied") is True
+                and number(pricing.get("delivery_charge")) == 0,
+            "delivery_charge_strikeoff": number(pricing.get("delivery_charge_strikeoff"))}
 
 
 def menu_offers(payload, quantity, restaurant_id=None, restaurant_name=None):
@@ -144,8 +167,10 @@ def quote_offer(client, offer, address_id):
             bill = read_bill(offer, cart)
             if bill["total"] < best["total"]:
                 best = bill
-        best["coupon_note"] = ("No coupons returned by Swiggy." if not cards else
+        best["coupon_note"] = ("No COD coupons returned by Swiggy." if not cards else
             f"{len(cards)} offers returned; {len(candidates)} explicit COD coupon codes checked. Other savings are unverified.")
+        if best.get("free_delivery_applied"):
+            best["coupon_note"] += " Free delivery offer applied."
     except Exception as exc:
         failure = exc
     finally:
