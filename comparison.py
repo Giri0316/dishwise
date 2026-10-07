@@ -17,28 +17,33 @@ def data_of(payload):
 
 
 def parse_cart(payload):
+    """Accept the documented envelope and observed raw gateway responses."""
     if not isinstance(payload, dict):
         raise AppError("Cart response was not recognized.", 502)
-    if payload.get("success") is False or payload.get("successful") is False:
-        raise AppError("Cart state could not be confirmed.", 502)
-    if "statusCode" in payload and payload["statusCode"] != 0:
-        raise AppError("Cart state could not be confirmed.", 502)
-    if "data" not in payload:
-        raise AppError("Cart response is missing data. Nothing was cleared.", 502)
-    data = payload["data"]
-    cart = data.get("data", data) if isinstance(data, dict) else data
-    confirmed = payload.get("success") is True or payload.get("successful") is True
-    # Observed populated gateway format: statusCode=0, data.result=success.
-    confirmed = confirmed or (
-        type(payload.get("statusCode")) is int and payload["statusCode"] == 0
-        and isinstance(cart, dict) and cart.get("result") == "success"
-    )
-    if not confirmed:
-        raise AppError("Cart state could not be confirmed.", 502)
-    if cart is None:
-        return None
-    if isinstance(cart, dict) and isinstance(cart.get("items"), list):
-        return None if not cart["items"] else cart
+    confirmed = False
+    current = payload
+    for _ in range(3):
+        if current.get("success") is False or current.get("successful") is False:
+            raise AppError("Cart state could not be confirmed.", 502)
+        if "statusCode" in current and (type(current["statusCode"]) is not int or current["statusCode"] != 0):
+            raise AppError("Cart state could not be confirmed.", 502)
+        confirmed = confirmed or current.get("success") is True or current.get("successful") is True
+        status_ok = type(current.get("statusCode")) is int and current["statusCode"] == 0
+        if "data" not in current:
+            raise AppError("Cart response is missing data. Nothing was cleared.", 502)
+        value = current["data"]
+        if value is None:
+            # The raw empty-cart gateway format identifies this as CART.
+            if confirmed or (status_ok and current.get("statusMessage") == "CART"):
+                return None
+            raise AppError("Empty cart state could not be confirmed. Nothing was cleared.", 502)
+        if not isinstance(value, dict):
+            raise AppError("Cart response was not recognized. Nothing was cleared.", 502)
+        if isinstance(value.get("items"), list):
+            if confirmed or (status_ok and value.get("result") == "success"):
+                return value if value["items"] else None
+            raise AppError("Cart state could not be confirmed.", 502)
+        current = value
     raise AppError("Cart response was not recognized. Review your cart in Swiggy.", 502)
 
 
@@ -72,6 +77,8 @@ def read_bill(offer, cart):
     total = number(pricing.get("to_pay"))
     if total is None:
         raise AppError("Swiggy did not return a payable total.", 502)
+    if any(number(pricing.get(key)) is None for key in ("item_total", "delivery_charge", "taxes_and_charges")):
+        raise AppError("Swiggy did not return the complete delivery and tax breakdown. This bill cannot be confirmed.", 502)
     discount = number(coupons.get("coupon_discount")) or 0
     code = coupons.get("coupon_applied")
     confirmed = bool(isinstance(code, str) and code and discount > 0)
@@ -130,7 +137,7 @@ def coupon_candidates(sections, cod_filtered):
     """Prefer Best coupon cards; only use explicit codes or code-only titles."""
     valid_sections = [section for section in sections if isinstance(section, dict)]
     best_sections = [section for section in valid_sections
-                     if "best" in str(section.get("title", "") or section.get("type", "")).lower()]
+                     if "best" in (str(section.get("title", "")) + " " + str(section.get("type", ""))).lower()]
     chosen = best_sections
     codes = []
     for section in chosen:
@@ -160,9 +167,11 @@ def quote_offer(client, offer, address_id):
     offer = deepcopy(offer)
     cart_args = {"addressId": address_id, "restaurantName": offer["restaurant"]}
     attempted, empty, best, failure = False, False, None, None
+    safe_to_continue = False
     try:
         if parse_cart(client.call("get_food_cart", cart_args)) is not None:
             raise AppError("Your Swiggy cart has items. Empty it yourself before a full-bill comparison.", 409)
+        safe_to_continue = True
         refreshed = menu_offers(client.call("search_menu", {"addressId": address_id,
             "query": offer["dish"], "restaurantIdOfAddedItem": offer["restaurant_id"]}),
             offer["quantity"], restaurant_id=offer["restaurant_id"], restaurant_name=offer["restaurant"])
@@ -170,6 +179,7 @@ def quote_offer(client, offer, address_id):
         if not exact or exact["customized"]:
             raise AppError("This dish is unavailable or requires a size/add-on choice. Its bill was not checked.", 409)
         offer = exact
+        safe_to_continue = False
         # Recheck after the menu call to avoid overwriting an intervening cart edit.
         if parse_cart(client.call("get_food_cart", cart_args)) is not None:
             raise AppError("Your cart changed before the check. Existing items were preserved.", 409)
@@ -179,10 +189,18 @@ def quote_offer(client, offer, address_id):
         cart = parse_cart(client.call("get_food_cart", cart_args))
         require_exact(cart, offer)
         best = read_bill(offer, cart)
-        coupons = data_of(client.call("fetch_food_coupons", {"addressId": address_id, "restaurantId": offer["restaurant_id"]}))
-        sections = coupons.get("coupon_sections")
-        if not isinstance(sections, list):
-            raise AppError("Coupon response was not recognized. The test cart will be cleaned up.", 502)
+        coupon_warning = None
+        try:
+            coupons = data_of(client.call("fetch_food_coupons", {"addressId": address_id, "restaurantId": offer["restaurant_id"]}))
+            sections = coupons.get("coupon_sections")
+            if not isinstance(sections, list):
+                raise AppError("Swiggy's coupon response was not recognized.", 502)
+        except AppError as exc:
+            if exc.status in (401, 429):
+                raise
+            # A read-only coupon lookup failure does not erase a full cart bill.
+            coupons, sections = {}, []
+            coupon_warning = "Coupon lookup could not be completed; additional savings are unverified."
         cards = [c for section in sections if isinstance(section, dict)
                  for c in section.get("coupons", []) if isinstance(c, dict)]
         filter_text = str((coupons.get("summary") or {}).get("filter_applied", "")).lower()
@@ -234,6 +252,8 @@ def quote_offer(client, offer, address_id):
                 f"No coupon discount confirmed after {len(checked)} checks. "
                 f"Swiggy returned {len(cards)} COD coupon cards."
             )
+        if coupon_warning:
+            best["coupon_note"] = coupon_warning
         if not best_section_found:
             best["coupon_note"] += " The MCP response did not expose a Best coupon section."
         elif not candidates:
@@ -263,6 +283,8 @@ def quote_offer(client, offer, address_id):
     if attempted and not empty:
         raise AppError("Cart cleanup could not be confirmed. Stop and check your cart in Swiggy before continuing.", 409)
     if failure:
+        if isinstance(failure, AppError):
+            failure.safe_to_continue = (empty if attempted else safe_to_continue) and failure.status not in (401, 429)
         raise failure
     return {"offer": best, "cart_empty": empty}
 
