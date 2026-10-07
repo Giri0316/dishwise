@@ -331,7 +331,9 @@ def debug_menu():
             "restaurantIdOfAddedItem": offer["restaurant_id"],
         })
 
-    refreshed = menu_offers(response, offer["quantity"])
+    refreshed = menu_offers(response, offer["quantity"],
+                            restaurant_id=offer["restaurant_id"],
+                            restaurant_name=offer["restaurant"])
     exact = next((row for row in refreshed if row["id"] == offer["id"]), None)
     if exact is None:
         reason = "original_item_not_in_parsed_available_results"
