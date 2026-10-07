@@ -26,19 +26,19 @@ def parse_cart(payload, allow_out_of_stock=False):
         if current.get("success") is False or current.get("successful") is False:
             raise AppError("Cart state could not be confirmed.", 502)
         if "statusCode" in current and (type(current["statusCode"]) is not int or current["statusCode"] != 0):
-            # Observed status 8 includes a populated but unavailable basket.
+            # Observed statuses 6 and 8 include populated unavailable baskets.
             # Recognize it only for an authorized clear or our own cleanup;
             # it must never be accepted as a purchasable/verified bill.
             value = current.get("data")
-            stock_basket = (type(current.get("statusCode")) is int and current["statusCode"] == 8
+            stock_basket = (type(current.get("statusCode")) is int and current["statusCode"] in (6, 8)
                             and isinstance(value, dict) and value.get("result") == "success"
                             and isinstance(value.get("items"), list) and bool(value["items"])
                             and all(isinstance(item, dict) for item in value["items"])
-                            and any(item.get("in_stock") in (False, 0) for item in value["items"]))
+                            and (current["statusCode"] == 6 or any(item.get("in_stock") in (False, 0) for item in value["items"])))
             if not stock_basket:
                 raise AppError("Cart state could not be confirmed. No new item was added.", 502)
             if not allow_out_of_stock:
-                raise AppError("Swiggy reports out-of-stock cart items; this bill cannot be confirmed.", 409)
+                raise AppError("Swiggy reports a closed restaurant or out-of-stock cart items; this bill cannot be confirmed.", 409)
             confirmed = True
         confirmed = confirmed or current.get("success") is True or current.get("successful") is True
         status_ok = type(current.get("statusCode")) is int and current["statusCode"] == 0
@@ -185,17 +185,16 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
     safe_to_continue = False
     existing_cart_cleared = False
     try:
-        existing = parse_cart(client.call("get_food_cart", cart_args),
-                              allow_out_of_stock=replace_existing_cart is True)
-        if existing is not None:
-            if replace_existing_cart is not True:
-                raise AppError("Your Swiggy cart has items. Allow cart replacement before comparing full bills.", 409)
-            # User has authorized removing existing items. Clear once, then
-            # verify fresh state before any new item is added. Never retry.
+        if replace_existing_cart is True:
+            # Cart removal has been explicitly authorized. Reset first so
+            # a closed restaurant/out-of-stock old basket cannot block it.
+            # A failure or unknown empty-state response stops before add.
             client.call("flush_food_cart", {})
             if parse_cart(client.call("get_food_cart", cart_args)) is not None:
-                raise AppError("Swiggy did not confirm an empty cart after clearing. No new item was added.", 409)
+                raise AppError("Swiggy did not confirm an empty cart after clearing. No comparison item was added.", 409)
             existing_cart_cleared = True
+        elif parse_cart(client.call("get_food_cart", cart_args)) is not None:
+            raise AppError("Your Swiggy cart has items. Allow cart replacement before comparing full bills.", 409)
         safe_to_continue = True
         refreshed = menu_offers(client.call("search_menu", {"addressId": address_id,
             "query": offer["dish"], "restaurantIdOfAddedItem": offer["restaurant_id"]}),
