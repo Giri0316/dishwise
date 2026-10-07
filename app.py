@@ -1,4 +1,4 @@
-"""Run locally with: python app.py. For a public deployment set APP_URL (see README)."""
+"""Run locally with: python app.py. For deployment, see README."""
 import base64
 import hashlib
 import logging
@@ -43,10 +43,13 @@ if PRODUCTION:
         raise ValueError(
             "APP_URL must look like https://your-domain.com (https, no path)."
         )
+
     if len(os.getenv("SECRET_KEY", "")) < 32:
         raise ValueError(
-            "Set SECRET_KEY to a random value of at least 32 characters in production."
+            "Set SECRET_KEY to a random value of at least 32 characters "
+            "in production."
         )
+
     ORIGIN = APP_URL
     ALLOWED_HOSTS = [parts.hostname]
 else:
@@ -75,7 +78,7 @@ if PRODUCTION:
         x_host=1,
     )
 
-# Tokens, temporary results and address IDs disappear when the process exits.
+# Tokens, temporary results and address IDs are memory-only.
 states = {}
 state_lock = threading.RLock()
 cart_lock = threading.Lock()
@@ -85,6 +88,7 @@ client_factory = SwiggyClient
 def state():
     with state_lock:
         sid = session.get("sid")
+
         if len(states) > 500:
             expired = [
                 key
@@ -346,7 +350,7 @@ def disconnect():
 
 @app.get("/api/tools")
 def list_swiggy_tools():
-    """List available MCP tools using the current user's Swiggy session."""
+    """List MCP tools available to the current authenticated user."""
     with client_factory(token()) as client:
         initialized = client.rpc(
             "initialize",
@@ -383,7 +387,6 @@ def list_swiggy_tools():
         params = {}
         seen_cursors = set()
 
-        # Bound pagination to prevent an endless provider response loop.
         for _ in range(20):
             result = client.rpc("tools/list", params)
 
@@ -526,6 +529,60 @@ def search():
             "Fees and coupons are unverified."
         ),
     )
+
+
+@app.get("/api/debug/coupons")
+def debug_coupons():
+    """Fetch the unfiltered coupon payload for a recent Live search match."""
+    access = token()
+    current = state().get("search", {})
+
+    if current.get("expires", 0) <= time.time():
+        raise AppError("Run a Live dish search first.", 409)
+
+    offers = current.get("offers", {})
+    offer_id = request.args.get("offer_id")
+
+    if offer_id:
+        offer = offers.get(offer_id)
+        if not offer:
+            raise AppError("Offer not found. Search again.", 404)
+    else:
+        offer = next(iter(offers.values()), None)
+
+    if not offer:
+        raise AppError(
+            "No dish matches found. Run another Live search.",
+            409,
+        )
+
+    # Avoid inspecting a temporary cart while a bill check is running.
+    if not cart_lock.acquire(blocking=False):
+        raise AppError(
+            "Wait for the current bill check and cleanup to finish.",
+            409,
+        )
+
+    try:
+        with client_factory(access) as client:
+            check_address(client, current["address_id"])
+            response = client.call(
+                "fetch_food_coupons",
+                {
+                    "addressId": current["address_id"],
+                    "restaurantId": offer["restaurant_id"],
+                },
+            )
+
+        # Preserve the provider payload without applying coupon filters.
+        return jsonify(
+            restaurant=offer["restaurant"],
+            dish=offer["dish"],
+            quantity=offer["quantity"],
+            response=response,
+        )
+    finally:
+        cart_lock.release()
 
 
 @app.post("/api/quote")
