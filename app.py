@@ -365,6 +365,23 @@ def debug_menu():
     )
 
 
+
+@app.get("/api/debug/cart")
+def debug_cart():
+    """Read the provider's current cart payload without modifying it."""
+    access, current, offer = diagnostic_offer()
+    if not cart_lock.acquire(blocking=False):
+        raise AppError("Wait for the current bill check and cleanup to finish.", 409)
+    try:
+        with client_factory(access) as client:
+            response = client.call("get_food_cart", {
+                "addressId": current["address_id"],
+            })
+        return jsonify(response=response)
+    finally:
+        cart_lock.release()
+
+
 if __name__ == "__main__":
     # Access logs can contain OAuth query parameters; keep them disabled.
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
