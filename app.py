@@ -248,7 +248,8 @@ def quote():
     try:
         with client_factory(token()) as client:
             check_address(client, current["address_id"])
-            result = quote_offer(client, offer, current["address_id"])
+            result = quote_offer(client, offer, current["address_id"],
+                                 replace_existing_cart=data.get("replace_existing_cart") is True)
         return jsonify(result)
     except AppError as exc:
         return jsonify(error=str(exc), safe_to_continue=getattr(exc, "safe_to_continue", False)), exc.status
