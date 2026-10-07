@@ -61,18 +61,25 @@ def read_bill(offer, cart):
             "discount": discount if confirmed else 0, "coupon": code if confirmed else None}
 
 
-def menu_offers(payload, quantity):
+def menu_offers(payload, quantity, restaurant_id=None, restaurant_name=None):
     items = data_of(payload).get("items")
     if not isinstance(items, list):
         raise AppError("Menu response format was not recognized.", 502)
     results = {}
     for item in items:
-        if not item.get("menu_item_id") or not item.get("restaurant_id") or item.get("inStock") in (False, 0):
+        if not isinstance(item, dict):
+            continue
+        # Scoped menu results can omit the per-item restaurant ID.
+        # Only use a fallback explicitly supplied by the scoped caller.
+        resolved_restaurant_id = item.get("restaurant_id") or restaurant_id
+        if not item.get("menu_item_id") or not resolved_restaurant_id or item.get("inStock") in (False, 0):
+            continue
+        if restaurant_id is not None and str(resolved_restaurant_id) != str(restaurant_id):
             continue
         price = number(item.get("price"))
-        identifier = str(item["restaurant_id"]) + ":" + str(item["menu_item_id"])
+        identifier = str(resolved_restaurant_id) + ":" + str(item["menu_item_id"])
         results[identifier] = {"id": identifier, "item_id": str(item["menu_item_id"]),
-            "restaurant_id": str(item["restaurant_id"]), "restaurant": str(item.get("restaurant_name") or "Swiggy restaurant"),
+            "restaurant_id": str(resolved_restaurant_id), "restaurant": str(item.get("restaurant_name") or restaurant_name or "Swiggy restaurant"),
             "dish": str(item.get("name") or "Menu item"), "quantity": quantity,
             "portion": str(item.get("portion_size") or "Portion size unknown"),
             "unit_price": price, "item_total": round(price * quantity, 2) if price is not None else None,
@@ -104,7 +111,8 @@ def quote_offer(client, offer, address_id):
         if parse_cart(client.call("get_food_cart", cart_args)) is not None:
             raise AppError("Your Swiggy cart has items. Empty it yourself before a full-bill comparison.", 409)
         refreshed = menu_offers(client.call("search_menu", {"addressId": address_id,
-            "query": offer["dish"], "restaurantIdOfAddedItem": offer["restaurant_id"]}), offer["quantity"])
+            "query": offer["dish"], "restaurantIdOfAddedItem": offer["restaurant_id"]}),
+            offer["quantity"], restaurant_id=offer["restaurant_id"], restaurant_name=offer["restaurant"])
         exact = next((row for row in refreshed if row["id"] == offer["id"]), None)
         if not exact or exact["customized"]:
             raise AppError("This dish is unavailable or requires a size/add-on choice. Its bill was not checked.", 409)
