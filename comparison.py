@@ -1,5 +1,6 @@
 """Comparison logic; prices are never inferred from discount advertising."""
 import math
+import re
 from copy import deepcopy
 from swiggy import AppError
 
@@ -125,6 +126,35 @@ def check_address(client, address_id):
     raise AppError("Choose an address saved in your own Swiggy account.", 403)
 
 
+def coupon_candidates(sections, cod_filtered):
+    """Prefer Best coupon cards; only use explicit codes or code-only titles."""
+    valid_sections = [section for section in sections if isinstance(section, dict)]
+    best_sections = [section for section in valid_sections
+                     if "best" in str(section.get("title", "") or section.get("type", "")).lower()]
+    chosen = best_sections
+    codes = []
+    for section in chosen:
+        cards = section.get("coupons", [])
+        if not isinstance(cards, list):
+            continue
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            status = str(card.get("applicabilityStatus", "")).upper()
+            if card.get("applicable") is False or status == "NOT_APPLICABLE":
+                continue
+            if not cod_filtered or not (card.get("applicable") is True or status in {"APPLICABLE", "APPLIED"}):
+                continue
+            code = card.get("couponCode") or card.get("coupon_code") or card.get("code")
+            # Some documented cards expose their coupon code as the title.
+            if not isinstance(code, str) or not code.strip():
+                title = card.get("title")
+                code = title if isinstance(title, str) and re.fullmatch(r"[A-Z][A-Z0-9_-]{2,39}", title) else None
+            if isinstance(code, str) and code.strip() and code.strip() not in codes:
+                codes.append(code.strip())
+    return codes, bool(best_sections)
+
+
 def quote_offer(client, offer, address_id):
     """Caller holds the cart lock. Never clears an existing or unexpected basket."""
     offer = deepcopy(offer)
@@ -153,22 +183,63 @@ def quote_offer(client, offer, address_id):
         sections = coupons.get("coupon_sections")
         if not isinstance(sections, list):
             raise AppError("Coupon response was not recognized. The test cart will be cleaned up.", 502)
-        cards = [c for section in sections for c in section.get("coupons", []) if isinstance(c, dict)]
+        cards = [c for section in sections if isinstance(section, dict)
+                 for c in section.get("coupons", []) if isinstance(c, dict)]
         filter_text = str((coupons.get("summary") or {}).get("filter_applied", "")).lower()
         cod = "cod" in filter_text or "cash on delivery" in filter_text
-        # An opaque offer id is not assumed to be an applicable coupon code.
-        candidates = [c for c in cards if isinstance(c.get("couponCode") or c.get("code"), str)
-            and (c.get("applicable") is True or c.get("applicabilityStatus") == "APPLICABLE") and cod][:2]
-        for coupon in candidates:
+        candidates, best_section_found = coupon_candidates(sections, cod)
+        checked, confirmed_codes = [], []
+        stopped_early = False
+        for code in candidates[:6]:
+            # Leave enough RPC capacity for the pre-check, application,
+            # verification and three cleanup calls. Never retry a mutation.
+            if getattr(client, "calls", 0) + 6 > 36:
+                stopped_early = True
+                break
             require_exact(parse_cart(client.call("get_food_cart", cart_args)), offer)
-            client.call("apply_food_coupon", {"addressId": address_id, "couponCode": coupon.get("couponCode") or coupon["code"]})
+            apply_error = None
+            try:
+                client.call("apply_food_coupon", {"addressId": address_id, "couponCode": code})
+            except AppError as exc:
+                if exc.status in (401, 429):
+                    raise
+                apply_error = exc
+            # Read actual state even when application reports an error.
             cart = parse_cart(client.call("get_food_cart", cart_args))
             require_exact(cart, offer)
             bill = read_bill(offer, cart)
-            if bill["total"] < best["total"]:
+            checked.append(code)
+            if bill["coupon"] == code and bill["discount"] > 0:
+                confirmed_codes.append(code)
+            if (bill["discount"], -bill["total"]) > (best["discount"], -best["total"]):
                 best = bill
-        best["coupon_note"] = ("No COD coupons returned by Swiggy." if not cards else
-            f"{len(cards)} offers returned; {len(candidates)} explicit COD coupon codes checked. Other savings are unverified.")
+            if apply_error is not None:
+                # Preserve the verified bill and stop after an uncertain call.
+                stopped_early = True
+                break
+        best["coupon_checks"] = {
+            "codes_tested": checked,
+            "confirmed_codes": confirmed_codes,
+            "best_section_returned": best_section_found,
+            "candidate_count": len(candidates),
+            "all_candidates_tested": not stopped_early and len(checked) == len(candidates),
+        }
+        if best.get("coupon") and best["discount"] > 0:
+            best["coupon_note"] = (
+                f"{best['coupon']} confirmed: Rs {best['discount']:.2f} off. "
+                f"Largest verified coupon discount among {len(checked)} checks; payable total confirmed by Swiggy."
+            )
+        else:
+            best["coupon_note"] = (
+                f"No coupon discount confirmed after {len(checked)} checks. "
+                f"Swiggy returned {len(cards)} COD coupon cards."
+            )
+        if not best_section_found:
+            best["coupon_note"] += " The MCP response did not expose a Best coupon section."
+        elif not candidates:
+            best["coupon_note"] += " The Best coupon section contained no usable eligible coupon codes."
+        if not best["coupon_checks"]["all_candidates_tested"]:
+            best["coupon_note"] += " Some candidates were not tested; maximum savings are unverified."
         if best.get("free_delivery_applied"):
             best["coupon_note"] += " Free delivery offer applied."
     except Exception as exc:
