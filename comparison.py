@@ -16,7 +16,7 @@ def data_of(payload):
     return value
 
 
-def parse_cart(payload):
+def parse_cart(payload, allow_out_of_stock=False):
     """Accept the documented envelope and observed raw gateway responses."""
     if not isinstance(payload, dict):
         raise AppError("Cart response was not recognized.", 502)
@@ -26,7 +26,20 @@ def parse_cart(payload):
         if current.get("success") is False or current.get("successful") is False:
             raise AppError("Cart state could not be confirmed.", 502)
         if "statusCode" in current and (type(current["statusCode"]) is not int or current["statusCode"] != 0):
-            raise AppError("Cart state could not be confirmed.", 502)
+            # Observed status 8 includes a populated but unavailable basket.
+            # Recognize it only for an authorized clear or our own cleanup;
+            # it must never be accepted as a purchasable/verified bill.
+            value = current.get("data")
+            stock_basket = (type(current.get("statusCode")) is int and current["statusCode"] == 8
+                            and isinstance(value, dict) and value.get("result") == "success"
+                            and isinstance(value.get("items"), list) and bool(value["items"])
+                            and all(isinstance(item, dict) for item in value["items"])
+                            and any(item.get("in_stock") in (False, 0) for item in value["items"]))
+            if not stock_basket:
+                raise AppError("Cart state could not be confirmed. No new item was added.", 502)
+            if not allow_out_of_stock:
+                raise AppError("Swiggy reports out-of-stock cart items; this bill cannot be confirmed.", 409)
+            confirmed = True
         confirmed = confirmed or current.get("success") is True or current.get("successful") is True
         status_ok = type(current.get("statusCode")) is int and current["statusCode"] == 0
         if "data" not in current:
@@ -73,6 +86,8 @@ def require_exact(cart, offer):
 
 
 def read_bill(offer, cart):
+    if any(item.get("in_stock") in (False, 0) for item in cart.get("items", []) if isinstance(item, dict)):
+        raise AppError("This dish is out of stock; its full bill cannot be confirmed.", 409)
     pricing, coupons = cart.get("pricing") or {}, cart.get("offers") or {}
     total = number(pricing.get("to_pay"))
     if total is None:
@@ -162,15 +177,25 @@ def coupon_candidates(sections, cod_filtered):
     return codes, bool(best_sections)
 
 
-def quote_offer(client, offer, address_id):
-    """Caller holds the cart lock. Never clears an existing or unexpected basket."""
+def quote_offer(client, offer, address_id, replace_existing_cart=False):
+    """Caller holds the lock; existing-cart replacement needs explicit consent."""
     offer = deepcopy(offer)
     cart_args = {"addressId": address_id, "restaurantName": offer["restaurant"]}
     attempted, empty, best, failure = False, False, None, None
     safe_to_continue = False
+    existing_cart_cleared = False
     try:
-        if parse_cart(client.call("get_food_cart", cart_args)) is not None:
-            raise AppError("Your Swiggy cart has items. Empty it yourself before a full-bill comparison.", 409)
+        existing = parse_cart(client.call("get_food_cart", cart_args),
+                              allow_out_of_stock=replace_existing_cart is True)
+        if existing is not None:
+            if replace_existing_cart is not True:
+                raise AppError("Your Swiggy cart has items. Allow cart replacement before comparing full bills.", 409)
+            # User has authorized removing existing items. Clear once, then
+            # verify fresh state before any new item is added. Never retry.
+            client.call("flush_food_cart", {})
+            if parse_cart(client.call("get_food_cart", cart_args)) is not None:
+                raise AppError("Swiggy did not confirm an empty cart after clearing. No new item was added.", 409)
+            existing_cart_cleared = True
         safe_to_continue = True
         refreshed = menu_offers(client.call("search_menu", {"addressId": address_id,
             "query": offer["dish"], "restaurantIdOfAddedItem": offer["restaurant_id"]}),
@@ -271,7 +296,7 @@ def quote_offer(client, offer, address_id):
                 import time
                 client.deadline = time.monotonic() + 80
             try:
-                cart = parse_cart(client.call("get_food_cart", cart_args))
+                cart = parse_cart(client.call("get_food_cart", cart_args), allow_out_of_stock=True)
                 if cart is None:
                     empty = True
                 else:
@@ -286,7 +311,7 @@ def quote_offer(client, offer, address_id):
         if isinstance(failure, AppError):
             failure.safe_to_continue = (empty if attempted else safe_to_continue) and failure.status not in (401, 429)
         raise failure
-    return {"offer": best, "cart_empty": empty}
+    return {"offer": best, "cart_empty": empty, "existing_cart_cleared": existing_cart_cleared}
 
 
 def sample_offers(dish, quantity, area):
