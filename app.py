@@ -287,6 +287,18 @@ def list_swiggy_tools():
         raise AppError("Tool listing exceeded the pagination limit.", 502)
 
 
+def redact_diagnostic(value):
+    """Remove authentication/session fields before exposing diagnostics."""
+    sensitive = {"tid", "sid", "token", "access_token", "refresh_token",
+                 "authorization", "cookie", "set-cookie", "deviceid"}
+    if isinstance(value, dict):
+        return {key: redact_diagnostic(item) for key, item in value.items()
+                if key.lower() not in sensitive}
+    if isinstance(value, list):
+        return [redact_diagnostic(item) for item in value]
+    return value
+
+
 def diagnostic_offer():
     """Use only offers from this session's recent live search."""
     access = token()
@@ -314,7 +326,7 @@ def debug_coupons():
                 "restaurantId": offer["restaurant_id"],
             })
         return jsonify(restaurant=offer["restaurant"], dish=offer["dish"],
-                       quantity=offer["quantity"], response=response)
+                       quantity=offer["quantity"], response=redact_diagnostic(response))
     finally:
         cart_lock.release()
 
@@ -361,7 +373,7 @@ def debug_menu():
         },
         refreshed_offers=refreshed,
         raw_matching_items=raw_matches,
-        response=response,
+        response=redact_diagnostic(response),
     )
 
 
@@ -377,7 +389,7 @@ def debug_cart():
             response = client.call("get_food_cart", {
                 "addressId": current["address_id"],
             })
-        return jsonify(response=response)
+        return jsonify(response=redact_diagnostic(response))
     finally:
         cart_lock.release()
 
