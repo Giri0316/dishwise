@@ -229,7 +229,7 @@ def search():
         result = client.call("search_menu", {"addressId": address_id, "query": dish, "offset": 0})
         rows = menu_offers(result, count)[:5]
     state()["search"] = {"address_id": address_id, "expires": time.time() + 900, "offers": {row["id"]: row for row in rows}}
-    return jsonify(offers=rows, scope="Up to five matches from the returned menu page. Fees and coupons are unverified.")
+    return jsonify(offers=rows, scope="Up to five menu matches. Full bills are checked automatically, one restaurant at a time.")
 
 
 @app.post("/api/quote")
@@ -250,6 +250,8 @@ def quote():
             check_address(client, current["address_id"])
             result = quote_offer(client, offer, current["address_id"])
         return jsonify(result)
+    except AppError as exc:
+        return jsonify(error=str(exc), safe_to_continue=getattr(exc, "safe_to_continue", False)), exc.status
     finally:
         cart_lock.release()
 
