@@ -213,6 +213,8 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
         cart = parse_cart(client.call("get_food_cart", cart_args))
         require_exact(cart, offer)
         best = read_bill(offer, cart)
+        initial_cart = deepcopy(cart)
+        best_cart = deepcopy(cart)
         coupon_warning = None
         try:
             coupons = data_of(client.call("fetch_food_coupons", {"addressId": address_id, "restaurantId": offer["restaurant_id"]}))
@@ -255,6 +257,7 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
                 confirmed_codes.append(code)
             if (bill["discount"], -bill["total"]) > (best["discount"], -best["total"]):
                 best = bill
+                best_cart = deepcopy(cart)
             if apply_error is not None:
                 # Preserve the verified bill and stop after an uncertain call.
                 stopped_early = True
@@ -310,7 +313,9 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
         if isinstance(failure, AppError):
             failure.safe_to_continue = (empty if attempted else safe_to_continue) and failure.status not in (401, 429)
         raise failure
-    return {"offer": best, "cart_empty": empty, "existing_cart_cleared": existing_cart_cleared}
+    return {"offer": best, "cart_empty": empty, "existing_cart_cleared": existing_cart_cleared,
+            "_bill_diagnostic": {"initial_cart": initial_cart, "best_cart": best_cart,
+                                 "coupon_response": coupons}}
 
 
 def sample_offers(dish, quantity, area):
