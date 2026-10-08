@@ -3,6 +3,7 @@ import math
 import re
 from copy import deepcopy
 from swiggy import AppError
+from matching import customization_reason, exact_dish
 
 
 def number(value):
@@ -75,6 +76,8 @@ def exact_basket(cart, offer):
     if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
         return False
     item = items[0]
+    if item.get("name") and not exact_dish(item["name"], offer["dish"]):
+        return False
     return (str(item.get("menu_item_id", "")) == offer["item_id"]
             and type(item.get("quantity")) is int and item["quantity"] == offer["quantity"]
             and all(item.get(key) in (None, []) for key in ("variants", "variations", "variantsV2", "addons")))
@@ -131,7 +134,7 @@ def menu_offers(payload, quantity, restaurant_id=None, restaurant_name=None):
             "unit_price": price, "item_total": round(price * quantity, 2) if price is not None else None,
             "delivery": None, "other_charges": None, "discount": 0, "coupon": None, "total": None,
             "status": "estimate", "rating": str(item.get("rating") or ""),
-            "customized": bool(item.get("hasVariants") or item.get("hasAddons") or item.get("variations") or item.get("variantsV2") or item.get("addons"))}
+            "customized": bool(customization_reason(item)), "customization_reason": customization_reason(item)}
     return sorted(results.values(), key=lambda row: row["item_total"] if row["item_total"] is not None else math.inf)
 
 
@@ -153,7 +156,8 @@ def coupon_candidates(sections, cod_filtered):
     valid_sections = [section for section in sections if isinstance(section, dict)]
     best_sections = [section for section in valid_sections
                      if "best" in (str(section.get("title", "")) + " " + str(section.get("type", ""))).lower()]
-    chosen = best_sections
+    chosen = best_sections or [section for section in valid_sections
+                               if "payment" not in (str(section.get("title", "")) + " " + str(section.get("type", ""))).lower()]
     codes = []
     for section in chosen:
         cards = section.get("coupons", [])
@@ -197,12 +201,12 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
             raise AppError("Your Swiggy cart has items. Allow cart replacement before comparing full bills.", 409)
         safe_to_continue = True
         refreshed = menu_offers(client.call("search_menu", {"addressId": address_id,
-            "query": offer["dish"], "restaurantIdOfAddedItem": offer["restaurant_id"]}),
+            "query": offer.get("menu_query", offer["dish"]), "offset": offer.get("menu_offset", 0), "restaurantIdOfAddedItem": offer["restaurant_id"]}),
             offer["quantity"], restaurant_id=offer["restaurant_id"], restaurant_name=offer["restaurant"])
         exact = next((row for row in refreshed if row["id"] == offer["id"]), None)
-        if not exact or exact["customized"]:
+        if not exact or exact["customized"] or not exact_dish(exact["dish"], offer["dish"]):
             raise AppError("This dish is unavailable or requires a size/add-on choice. Its bill was not checked.", 409)
-        offer = exact
+        offer = {**offer, **exact}
         safe_to_continue = False
         # Recheck after the menu call to avoid overwriting an intervening cart edit.
         if parse_cart(client.call("get_food_cart", cart_args)) is not None:
@@ -228,22 +232,24 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
             coupons, sections = {}, []
             coupon_warning = "Coupon lookup could not be completed; additional savings are unverified."
         cards = [c for section in sections if isinstance(section, dict)
-                 for c in section.get("coupons", []) if isinstance(c, dict)]
+                 for c in (section.get("coupons") if isinstance(section.get("coupons"), list) else []) if isinstance(c, dict)]
         filter_text = str((coupons.get("summary") or {}).get("filter_applied", "")).lower()
         cod = "cod" in filter_text or "cash on delivery" in filter_text
         candidates, best_section_found = coupon_candidates(sections, cod)
         checked, confirmed_codes = [], []
         stopped_early = False
-        for code in candidates[:6]:
+        for code in candidates:
             # Leave enough RPC capacity for the pre-check, application,
             # verification and three cleanup calls. Never retry a mutation.
             if getattr(client, "calls", 0) + 6 > 36:
                 stopped_early = True
                 break
-            require_exact(parse_cart(client.call("get_food_cart", cart_args)), offer)
+            cart = parse_cart(client.call("get_food_cart", cart_args))
+            require_exact(cart, offer)
             apply_error = None
             try:
-                client.call("apply_food_coupon", {"addressId": address_id, "couponCode": code})
+                client.call("apply_food_coupon", {"addressId": address_id, "couponCode": code,
+                    **({"cartId": str(cart["cart_id"])} if cart.get("cart_id") is not None else {})})
             except AppError as exc:
                 if exc.status in (401, 429):
                     raise
@@ -255,7 +261,7 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
             checked.append(code)
             if bill["coupon"] == code and bill["discount"] > 0:
                 confirmed_codes.append(code)
-            if (bill["discount"], -bill["total"]) > (best["discount"], -best["total"]):
+            if bill["coupon"] == code and (bill["discount"], -bill["total"]) > (best["discount"], -best["total"]):
                 best = bill
                 best_cart = deepcopy(cart)
             if apply_error is not None:
@@ -268,6 +274,7 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
             "best_section_returned": best_section_found,
             "candidate_count": len(candidates),
             "all_candidates_tested": not stopped_early and len(checked) == len(candidates),
+            "availability": "lookup_failed" if coupon_warning else "none_returned" if not cards else "returned",
         }
         if best.get("coupon") and best["discount"] > 0:
             best["coupon_note"] = (
@@ -277,12 +284,12 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
         else:
             best["coupon_note"] = (
                 f"No coupon discount confirmed after {len(checked)} checks. "
-                f"Swiggy returned {len(cards)} COD coupon cards."
+                f"Swiggy returned {len(cards)} coupon cards for this cart."
             )
         if coupon_warning:
             best["coupon_note"] = coupon_warning
         if not best_section_found:
-            best["coupon_note"] += " The MCP response did not expose a Best coupon section."
+            best["coupon_note"] += " No Best coupon section was returned; other eligible returned offers were considered."
         elif not candidates:
             best["coupon_note"] += " The Best coupon section contained no usable eligible coupon codes."
         if not best["coupon_checks"]["all_candidates_tested"]:
@@ -316,21 +323,3 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
     return {"offer": best, "cart_empty": empty, "existing_cart_cleared": existing_cart_cleared,
             "_bill_diagnostic": {"initial_cart": initial_cart, "best_cart": best_cart,
                                  "coupon_response": coupons}}
-
-
-def sample_offers(dish, quantity, area):
-    base = 125 if "roll" in dish.lower() else 285 if "pizza" in dish.lower() else 230
-    rows = []
-    for i, restaurant in enumerate(["Copper Pot Kitchen", "The Rice Room", "Pepper & Plate", "Kitchen No. 7"]):
-        unit = base + [0, 19, 38, 12][i]
-        subtotal = unit * quantity
-        delivery = [35, 25, 39, 45][i] + (8 if "Bengaluru" in area else 0)
-        charges = round(subtotal * 0.05) + [16, 22, 28, 24][i]
-        discount = 80 if i == 0 and subtotal >= 399 else min(100, math.floor(subtotal * 0.2)) if i == 1 and subtotal >= 499 else 0
-        rows.append({"id": f"demo-{i}", "restaurant": restaurant, "dish": dish, "quantity": quantity,
-            "portion": "Regular · sample portion", "unit_price": unit, "item_total": subtotal,
-            "delivery": delivery, "other_charges": charges, "discount": discount,
-            "coupon": ("MEAL80" if i == 0 else "TASTE20") if discount else None,
-            "total": subtotal + delivery + charges - discount, "status": "demo", "customized": False,
-            "rating": ["4.5", "4.3", "4.6", "4.2"][i], "coupon_note": "Fictional demonstration offer."})
-    return sorted(rows, key=lambda row: row["total"])

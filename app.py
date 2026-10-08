@@ -13,11 +13,14 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, render_template, request, session
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
-from comparison import check_address, data_of, menu_offers, quote_offer, sample_offers
+from comparison import check_address, data_of, menu_offers, quote_offer
 from swiggy import AppError, BASE_URL, SwiggyClient, auth_post
+from matching import exact_dish
+from ai_dishes import ai_ready, suggest_dishes
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
+from discovery import new_search, step as discovery_step, public_search
 PORT = int(os.getenv("PORT", "8765"))
 if not 1024 <= PORT <= 65535:
     raise ValueError("PORT must be between 1024 and 65535.")
@@ -141,7 +144,7 @@ def healthz():
 @app.get("/api/config")
 def config():
     current = state()
-    return jsonify(csrf=current["csrf"], connected=bool(current.get("token") and current.get("expires", 0) > time.time()))
+    return jsonify(csrf=current["csrf"], ai_enabled=ai_ready(), connected=bool(current.get("token") and current.get("expires", 0) > time.time()))
 
 
 @app.post("/api/auth/start")
@@ -214,22 +217,63 @@ def addresses():
             has_more=bool((data.get("pagination") or {}).get("hasMore")))
 
 
+@app.post("/api/dish/suggest")
+def dish_suggest():
+    token()
+    data = body()
+    dish = text(data.get("dish"), "dish", 1, 100)
+    current = state()
+    if current.get("suggest_after", 0) > time.time():
+        raise AppError("Wait a few seconds before another dish suggestion.", 429)
+    current["suggest_after"] = time.time() + 3
+    return jsonify(suggest_dishes(dish))
+
+
+def search_run(search_id):
+    current = state().get("search", {})
+    if (not search_id or current.get("id") != search_id
+            or current.get("expires", 0) <= time.time()
+            or current.get("hard_expires", 0) <= time.time()):
+        raise AppError("This search expired or was replaced. Find your deal again.", 409)
+    current["expires"] = min(time.time() + 1800, current["hard_expires"])
+    return current
+
+
 @app.post("/api/search")
 def search():
     data = body()
-    dish, count = text(data.get("dish"), "dish", 1, 100), quantity(data.get("quantity"))
     if data.get("mode") == "demo":
-        area = text(data.get("area", "Adyar, Chennai"), "area", 1, 200)
-        return jsonify(offers=sample_offers(dish, count, area), scope="Fictional sample prices.")
-    if data.get("mode") != "live":
-        raise AppError("Select Demo or Live mode.")
+        raise AppError("Only live Swiggy searches are available.")
+    dish = text(data.get("confirmed_dish"), "confirmed exact dish name", 1, 100)
+    count = quantity(data.get("quantity"))
     address_id = text(data.get("address_id"), "saved delivery address")
-    with client_factory(token()) as client:
-        check_address(client, address_id)
-        result = client.call("search_menu", {"addressId": address_id, "query": dish, "offset": 0})
-        rows = menu_offers(result, count)[:5]
-    state()["search"] = {"address_id": address_id, "expires": time.time() + 900, "offers": {row["id"]: row for row in rows}}
-    return jsonify(offers=rows, scope="Up to five menu matches. Full bills are checked automatically, one restaurant at a time.")
+    if not cart_lock.acquire(blocking=False):
+        raise AppError("Wait for the current bill check to finish.", 409)
+    try:
+        with client_factory(token()) as client:
+            check_address(client, address_id)
+        run = new_search(dish, count, address_id)
+        state()["search"] = run
+        return jsonify(public_search(run))
+    finally:
+        cart_lock.release()
+
+
+@app.post("/api/search/next")
+def search_next():
+    access = token()
+    current = search_run(body().get("search_id"))
+    with state_lock:
+        if current["busy"]:
+            raise AppError("A search page is already loading.", 409)
+        current["busy"] = True
+    try:
+        with client_factory(access) as client:
+            discovery_step(current, client)
+        return jsonify(public_search(current))
+    finally:
+        with state_lock:
+            current["busy"] = False
 
 
 @app.post("/api/quote")
@@ -237,10 +281,14 @@ def quote():
     data = body()
     if data.get("consent") is not True:
         raise AppError("Confirm temporary cart use before checking bills.")
-    current = state().get("search", {})
+    current = search_run(data.get("search_id"))
+    if not current.get("done"):
+        raise AppError("Finish restaurant discovery before checking bills.", 409)
     offer = current.get("offers", {}).get(data.get("offer_id"))
     if not offer or current.get("expires", 0) <= time.time():
         raise AppError("Search again before checking this bill.", 409)
+    if not exact_dish(offer["dish"], current["dish"]) or not 0 <= offer.get("distance_km", 999) < 7:
+        raise AppError("This item does not match the confirmed dish and distance filter.", 409)
     if offer["customized"]:
         raise AppError("This dish requires a customization. Check it in Swiggy.", 409)
     if not cart_lock.acquire(blocking=False):
@@ -252,7 +300,7 @@ def quote():
                                  replace_existing_cart=data.get("replace_existing_cart") is True)
         captured = result.pop("_bill_diagnostic", None)
         if captured is not None:
-            # Bounded by the five searched offers; discarded with the search.
+            # Captured for searched offers only; discarded with the search.
             with state_lock:
                 current.setdefault("bill_diagnostics", {})[offer["id"]] = {
                     "restaurant": offer["restaurant"], "dish": offer["dish"],
@@ -260,6 +308,7 @@ def quote():
                     "cart_empty_after_check": result["cart_empty"],
                     **redact_diagnostic(captured),
                 }
+        current.setdefault("quoted", {})[offer["id"]] = result["offer"]
         return jsonify(result)
     except AppError as exc:
         return jsonify(error=str(exc), safe_to_continue=getattr(exc, "safe_to_continue", False)), exc.status

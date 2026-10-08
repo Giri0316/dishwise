@@ -5,7 +5,7 @@ import httpx
 
 BASE_URL = "https://mcp.swiggy.com"
 ALLOWED_TOOLS = frozenset({
-    "get_addresses", "create_address", "search_menu", "get_food_cart",
+    "get_addresses", "create_address", "search_menu", "search_restaurants", "get_food_cart",
     "update_food_cart", "fetch_food_coupons", "apply_food_coupon", "flush_food_cart",
 })
 
