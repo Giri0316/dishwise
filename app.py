@@ -250,6 +250,16 @@ def quote():
             check_address(client, current["address_id"])
             result = quote_offer(client, offer, current["address_id"],
                                  replace_existing_cart=data.get("replace_existing_cart") is True)
+        captured = result.pop("_bill_diagnostic", None)
+        if captured is not None:
+            # Bounded by the five searched offers; discarded with the search.
+            with state_lock:
+                current.setdefault("bill_diagnostics", {})[offer["id"]] = {
+                    "restaurant": offer["restaurant"], "dish": offer["dish"],
+                    "captured_at": time.time(), "offer": result["offer"],
+                    "cart_empty_after_check": result["cart_empty"],
+                    **redact_diagnostic(captured),
+                }
         return jsonify(result)
     except AppError as exc:
         return jsonify(error=str(exc), safe_to_continue=getattr(exc, "safe_to_continue", False)), exc.status
@@ -300,6 +310,25 @@ def redact_diagnostic(value):
     if isinstance(value, list):
         return [redact_diagnostic(item) for item in value]
     return value
+
+
+@app.get("/api/debug/bill")
+def debug_bill():
+    """Read captured charges before cleanup; never mutates the live cart."""
+    token()
+    current = state().get("search", {})
+    if current.get("expires", 0) <= time.time():
+        raise AppError("Run Find my deal again to capture fresh bills.", 409)
+    captures = current.get("bill_diagnostics", {})
+    restaurant = request.args.get("restaurant", "").strip().casefold()
+    offer_id = request.args.get("offer_id")
+    matches = [row for key, row in captures.items()
+               if (not offer_id or key == offer_id)
+               and (not restaurant or row["restaurant"].casefold() == restaurant)]
+    if not matches:
+        return jsonify(error="No captured bill for this selection. Run Find my deal and use a restaurant with a completed bill.",
+                       available_restaurants=sorted({row["restaurant"] for row in captures.values()})), 404
+    return jsonify(bills=redact_diagnostic(matches))
 
 
 def diagnostic_offer():
