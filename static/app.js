@@ -19,19 +19,21 @@ function working(value, message = "") {
 function progress(message) {$("progress").hidden = false; $("progress").textContent = message;}
 function render() {
   const confirmed = offers.filter(o => o.status === "verified");
+  const quoted = offers.filter(o => o.status === "verified" || o.status === "coupon_unverified");
   $("results-title").textContent = busy ? "Comparing your exact dish" : "Your comparison";
-  $("results-summary").textContent = selectedDish ? `${requestedQuantity} × ${selectedDish} · Below 7 km · ${new Set(offers.map(o => o.restaurant_id)).size} matching restaurants` : "Connect Swiggy, then choose your dish and address.";
-  offers.sort((a,b) => (a.status === "verified" ? 0 : 1) - (b.status === "verified" ? 0 : 1) || (a.total ?? Infinity) - (b.total ?? Infinity));
+  $("results-summary").textContent = selectedDish ? `${requestedQuantity} × ${selectedDish} · Below 7 km · ${new Set(offers.map(o => o.restaurant_id)).size} of up to 40 shortlisted restaurants` : "Connect Swiggy, then choose your dish and address.";
+  offers.sort((a,b) => (a.status === "verified" ? 0 : 1) - (b.status === "verified" ? 0 : 1) || (a.total ?? a.item_total ?? Infinity) - (b.total ?? b.item_total ?? Infinity));
   $("results").innerHTML = offers.length ? offers.map((o,i) => {
-    const complete = o.status === "verified";
+    const verified = o.status === "verified";
+    const complete = verified || o.status === "coupon_unverified";
     const state = o.status === "checking" ? "Checking bill…" : o.status === "failed" ? "Bill unavailable" : o.status === "skipped" ? "Needs choices" : "Awaiting check";
-    const couponState = o.coupon_checks?.availability === "lookup_failed" ? "Coupon availability could not be checked" : "No coupon discount confirmed";
-    return `<article class="offer ${complete && i === 0 ? "best" : ""}">${complete && i === 0 ? '<div class="ribbon">LOWEST AMONG RETURNED MCP QUOTES</div>' : ""}<div class="offer-body"><span class="avatar">${esc(o.restaurant[0])}</span><div><h3>${esc(o.restaurant)}</h3><p class="dish">${esc(o.dish)}</p><div class="meta">${esc(o.distance_km)} km · ${o.rating ? "★ " + esc(o.rating) + " · " : ""}${esc(o.portion)}</div></div><div class="price"><strong>${complete ? money(o.total) : "—"}</strong><small>${complete ? "MCP total for " + o.quantity : state}</small></div></div>${complete ? `<div class="charge-grid">${[["Items",o.item_total],["Delivery",o.delivery],["GST & other charges",o.other_charges],["Coupon savings",o.discount]].map(([label,n])=>`<div><span>${label}</span><strong>${money(n)}</strong></div>`).join("")}</div>` : ""}<div class="offer-foot"><span>${complete ? o.discount > 0 ? `${esc(o.coupon)} · ${money(o.discount)} confirmed` : esc(couponState + (o.free_delivery_applied ? " · Free delivery in MCP quote" : "")) : esc(o.bill_error || state)}</span>${complete ? `<button data-bill="${i}">View bill</button>` : ""}</div></article>`;
+    const couponState = o.status === "coupon_unverified" ? "Coupon verification incomplete — excluded from ranking" : "No eligible coupon returned";
+    return `<article class="offer ${verified && i === 0 ? "best" : ""}">${verified && i === 0 ? '<div class="ribbon">LOWEST VERIFIED TOTAL IN SHORTLIST</div>' : ""}<div class="offer-body"><span class="avatar">${esc(o.restaurant[0])}</span><div><h3>${esc(o.restaurant)}</h3><p class="dish">${esc(o.dish)}</p><div class="meta">${esc(o.distance_km)} km · ${o.rating ? "★ " + esc(o.rating) + " · " : ""}${esc(o.portion)}</div></div><div class="price"><strong>${complete ? money(o.total) : money(o.item_total)}</strong><small>${complete ? (verified ? "MCP total for " : "Bill before coupon verification · ") + o.quantity : "Dish price only · " + state}</small></div></div>${complete ? `<div class="charge-grid">${[["Items",o.item_total],["Delivery",o.delivery],["GST & other charges",o.other_charges],["Coupon savings",o.discount]].map(([label,n])=>`<div><span>${label}</span><strong>${money(n)}</strong></div>`).join("")}</div>` : ""}<div class="offer-foot"><span>${complete ? o.status === "coupon_unverified" ? esc(couponState + (o.discount > 0 ? " · " + o.coupon + " saved " + money(o.discount) : "")) : o.discount > 0 ? `${esc(o.coupon)} · ${money(o.discount)} confirmed` : esc(couponState + (o.free_delivery_applied ? " · Free delivery in MCP quote" : "")) : esc(o.bill_error || state)}</span>${complete ? `<button data-bill="${i}">View bill</button>` : ""}</div></article>`;
   }).join("") : '<div class="empty"><h3>Compare the same dish.</h3><p>We’ll confirm the exact name before searching nearby menus.</p></div>';
   if (run) {
     $("coverage").hidden = false;
-    $("coverage").textContent = `${run.pages_checked} discovery pages checked · ${run.restaurants_seen} restaurant records · ${run.restaurants_matched} matching restaurants.\n${run.done ? run.partial ? "Discovery is incomplete. " : "Reached the end of the returned search pages. " : "Discovery is still in progress. "}${(run.warnings || []).join(" ")}`;
-    $("footnote").textContent = `${confirmed.length} of ${offers.length} exact menu matches have full MCP quotes. ${run.scope || ""} Failed, stopped and customization-dependent checks are excluded from price ranking.`;
+    $("coverage").textContent = `${run.pages_checked}/${run.page_limit || 64} discovery pages · ${run.candidates_found ?? run.restaurants_matched} exact restaurant matches collected · ${run.shortlisted ?? offers.length}/40 selected.\n${run.done ? "Dish-price shortlist ready. " : "Collecting a bounded candidate pool. "}${(run.warnings || []).join(" ")}`;
+    $("footnote").textContent = `${quoted.length} of ${offers.length} shortlisted restaurants have full bills; ${confirmed.length} completed coupon verification. ${run.scope || ""} Failed bills and incomplete coupon checks are excluded from ranking.`;
   }
 }
 async function startSearch(event) {
@@ -61,18 +63,18 @@ async function compare() {
   stopRequested = false; $("stop").hidden = false; $("resume").hidden = true; let canResume = true;
   try {
     while (!run.done && !stopRequested) {
-      progress(`Searching menus and distances · ${run.pages_checked} pages checked · ${run.pending_pages} pages queued…`);
+      progress(`${run.phase === "distances" ? "Checking nearby branches in dish-price order" : "Collecting dish prices"} · ${run.pages_checked}/${run.page_limit || 64} pages · ${run.candidates_found || 0} exact restaurant matches · discovery budget ${run.seconds_limit || 120}s…`);
       run = await api("search/next", {search_id:run.search_id}); render();
     }
     if (!run.done) return;
-    if (!offers.length) offers = run.offers.map(o => ({...o, status:o.customized ? "skipped" : "pending", bill_error:o.customization_reason || ""}));
+    if (!offers.length) offers = run.offers.map(o => ({...o, status:o.customized && !o.needs_menu_detail ? "skipped" : "pending", bill_error:o.needs_menu_detail ? "" : o.customization_reason || ""}));
     render();
     if (!offers.length) {error("No exact matches with confirmed distance below 7 km were returned. Try a more precise restaurant menu name."); return;}
-    const candidates = offers.filter(o => ["pending","incomplete"].includes(o.status));
+    const candidates = offers.filter(o => ["pending","incomplete"].includes(o.status)).sort((a,b) => (a.shortlist_rank ?? Infinity) - (b.shortlist_rank ?? Infinity) || (a.item_total ?? Infinity) - (b.item_total ?? Infinity));
     for (const [index, offer] of candidates.entries()) {
       if (stopRequested) break;
       offer.status = "checking"; render();
-      progress(`Checking full bill ${index+1} of ${candidates.length} · ${offer.restaurant} · ${offer.distance_km} km…`);
+      progress(`Checking bill and coupons ${index+1} of ${candidates.length} · ${offer.restaurant} · ${offer.distance_km} km…`);
       try {
         const result = await api("quote", {search_id:run.search_id, offer_id:offer.id, consent:true, replace_existing_cart:true});
         if (!result.cart_empty) throw Error("Cart cleanup could not be confirmed. Review your cart before another comparison.");

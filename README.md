@@ -1,10 +1,10 @@
-# Dishwise — live exact-dish comparison
+# Dishwise — cheapest 40 nearby exact-dish matches
 
 This is the complete updated Python/Flask project for your existing Render service.
 
 ## Deploy the update
 
-1. Replace the project files with the contents of this folder. Preserve your existing secret environment settings. The main changed files are `app.py`, `comparison.py`, `swiggy.py`, `static/app.js`, `static/style.css`, and `templates/index.html`. Add the new `matching.py`, `discovery.py`, and `ai_dishes.py` files.
+1. Replace the project files with the contents of this folder. Preserve your existing secret environment settings. The main changed files are `app.py`, `comparison.py`, `swiggy.py`, `static/app.js`, `static/style.css`, and `templates/index.html`. Include `matching.py`, `discovery.py`, `ai_dishes.py` and the new `coupons.py` file. Replace the frontend and backend together.
 2. Commit/push and redeploy your existing Render service. Keep one Gunicorn worker because session data is stored in process memory. The included `render.yaml` preserves that setup.
 3. In Render → Environment, set `GEMINI_API_KEY` to your own Gemini API key and `GEMINI_MODEL` to a text model enabled for that key. `gemini-3.5-flash-lite` is an example from Google's current model catalog; use the model available to your account. Keys stay on the server. Do not put them in JavaScript or commit them.
 4. Redeploy after changing environment settings, refresh Dishwise, and connect Swiggy again if the process restarted.
@@ -15,21 +15,40 @@ The AI cannot be activated without your provider credentials. Without both varia
 
 Enter a dish and quantity, choose your saved address, and click **Find my deal**. The app asks which exact dish you mean. Select a suggestion or type the exact name, then compare. Dosa, Dosai and Plain Dosa normalize to the same plain dish. Masala, onion, rava, ghee, cheese, combinations and differently named portions do not match Plain Dosa. Other names use exact normalized token equality; uncertain aliases are excluded. No fuzzy substring or AI-based recipe substitution is used.
 
-Discovery follows all pages exposed by `search_restaurants` and `search_menu`, including scoped restaurant menu pages. The previous five-result cap is removed. Swiggy restaurant IDs identify the branch; only `availabilityStatus=OPEN` and a numeric `distanceKm < 7` qualify. Exactly 7 km is excluded. Unknown distance or availability is never invented. The coverage panel reports pages, restaurants, incomplete pagination and missing distance data. This does not guarantee the search gateway exposes every restaurant in the real world.
+## Bounded discovery and the 40-restaurant shortlist
 
-Every eligible exact menu match is processed sequentially for a full MCP bill. Optional add-ons are omitted only when their returned minimum selection counts are explicitly zero. Required variants/add-ons and missing selection requirements are marked as needing choices. Such cards remain visible and are counted as unchecked; their prices are not treated as full bills. A changed dish, provider error or unavailable restaurant can also prevent a quote. Safe per-item failures continue after verified cleanup; uncertain cart state, rate limits or authentication errors stop the comparison.
+The previous version could expand a queue into every nearby restaurant's menu. That caused the observed 119 discovery pages before rate limiting. This version removes that expansion.
 
-**Existing cart items are removed when a bill check begins and are not restored**, as requested. The app clears and verifies the cart, adds the exact menu item ID, verifies quantity and selections, reads the bill, then clears only the expected test basket. No ordering or payment tool is enabled. Leave the Swiggy cart unchanged during a comparison.
+1. Collect cross-restaurant dish results with exact recipe matching. Collect a small set of restaurant metadata pages for distance and availability.
+2. Keep the cheapest returned exact menu item per restaurant ID. Exclude missing prices. Sort by dish price for the requested quantity, low to high.
+3. Resolve unknown branch distances in that price order, using exact restaurant IDs. Keep only OPEN restaurants strictly below 7 km. Exactly 7 km and unknown distances are excluded.
+4. Shortlist the first **40 distinct qualifying restaurants**, or fewer if fewer qualify. Only then refresh each selected item and calculate its full bill and coupons. No scoped menu crawling occurs during discovery.
+5. Rank completed bills by the final payable total after confirmed coupons. A bill whose coupon checks could not be completed remains visible with an explicit warning and is excluded from the cheapest-result ranking.
 
-There is a Stop button and a Continue button for intentionally paused discovery/comparison. A search expires after 30 minutes of inactivity or four hours overall. Each page is a separate short HTTP request; bill requests run one at a time. `MAX_DISCOVERY_PAGES` defaults to 2000 as an abuse/runaway safeguard. Reaching it is shown as incomplete coverage, never as a complete comparison.
+Search has hard limits: at most 20 cross-restaurant menu pages, four initial restaurant metadata pages, two pages per unresolved branch lookup, and 64 discovery calls in total. The menu collection phase starts winding down after 55 seconds; discovery stops after a **120-second budget plus any request already in flight**. These are ceilings, not targets. A small result pool finishes earlier. Old `MAX_DISCOVERY_PAGES=2000` settings are clamped to 64. The app reuses a server-issued MCP session when one is supplied, reducing repeated initialization calls.
 
-## Coupons and pricing limitations
+Swiggy's documented search does not expose an item-price sort parameter. Therefore these are the cheapest qualifying matches **among the bounded results collected**, not a guarantee of the 40 cheapest restaurants across the entire city. The interface reports coverage and the number selected. It does not invent restaurants to fill the 40 slots.
 
-The app fetches live coupons after adding the actual item/quantity. It checks applicable codes from Best coupon sections first. When that section is absent, it considers other eligible returned sections, excluding payment-offer sections. It accepts explicit code fields or code-only titles, never guesses from an opaque coupon ID, and requires the returned COD filter and applicability. Each application includes the current cart ID when present. A savings amount is confirmed only when a fresh cart shows that exact code and a positive discount.
+A fresh scoped item lookup checks the exact item ID, recipe and customization requirements immediately before building each test cart. At most four scoped pages are searched for that selected item. Cross-restaurant pagination offsets are never reused as scoped-menu offsets. Known optional add-ons with minimum zero are omitted; required or unknown selections fail that bill explicitly. Safe per-item failures continue after confirmed cleanup.
 
-The six-code slice is removed, but the bounded MCP call/time budget remains. Capacity is reserved for cleanup. If not every candidate can be tested, the bill says maximum savings are unverified. Among checked candidates, the largest confirmed coupon discount wins, with lower payable total breaking ties. Restaurant cards are ranked by final payable total.
+Existing cart items are removed when bill checks begin and are not restored, as requested. The app verifies an empty cart, adds the selected item and quantity, reads prices/coupons, and then clears only the expected test basket. No ordering or payment tool is enabled. Leave the Swiggy cart unchanged during checks.
 
-An empty coupon list is not a working discount. In your captured Aruvi example, Swiggy returned zero COD coupons and a ₹146 MCP bill while mobile checkout showed ₹217 with different item and delivery discounts. This release does not fabricate the missing ₹89 item price or a coupon. The UI labels totals as MCP quotes and states that mobile checkout may differ. Ask Swiggy engineering about missing promotions or pricing parity.
+Up to 40 full bills can still take several minutes: each uses actual cart calls. Stop waits for the current request and cleanup. Continue resumes remaining safe work. Authentication errors, provider rate limits and uncertain cleanup stop the run; no automatic cart-mutation retry is made. A search expires after 30 minutes of inactivity or four hours overall.
+
+## Coupon checks
+
+- Fetch current coupons after adding the actual item and quantity.
+- Test actual codes from **Best coupons and More offers**, with Best coupons first. A Best section no longer hides More offers. Exclude explicitly inapplicable codes and payment-specific offers.
+- Missing optional `filter_applied` metadata no longer discards otherwise usable returned codes. The application response and fresh cart determine success.
+- Also test a code suggested by the cart, even if its initial discount is zero, unless the returned coupon details explicitly disallow it. A suggestion alone is never reported as savings.
+- Accept explicit coupon-code fields or code-only titles; never guess from opaque coupon IDs.
+- Include the current cart ID with each application, verify the exact test basket afterward, and require the same code plus a positive cart discount.
+- Keep the largest confirmed coupon saving among checked candidates; use the lower final total to break a savings tie. All tax, delivery and payable values come from the cart response.
+- A failed coupon lookup, an available card without a usable code, an application without confirmed savings, or an exhausted test budget yields **Coupon verification incomplete**. The full bill remains visible but cannot win the cheapest-result ranking.
+
+Each restaurant retains a 36-RPC budget with capacity reserved for cleanup. All candidates are attempted when they fit; any untested candidate is disclosed. No unsupported claim of a guaranteed maximum discount is made.
+
+Your earlier Aruvi response returned an empty COD coupon list. If Swiggy returns neither a usable coupon code nor a cart suggestion, the app has nothing to apply. Item promotions and payment-specific discounts visible only in the mobile app cannot be manufactured. Prices are labeled as MCP quotes because mobile checkout may differ.
 
 ## Diagnostics
 
@@ -44,7 +63,7 @@ Diagnostics are authenticated, uncached and session-scoped. Authentication/sessi
 
 Python 3.12 recommended. Install with `pip install -r requirements.txt`. Copy `.env.example` to `.env`, set your own credentials, and run `python app.py`. Use the deployed URL for Swiggy authentication unless a local redirect URI is separately approved.
 
-Run `python -m unittest discover -s tests -v` , `node tests/test_ui.cjs` and `node --check static/app.js`. The UI test simulates DOM interactions; browser layout and live provider calls have not been verified. Tests use simulated Swiggy responses; they do not authenticate, mutate a live cart, call Gemini or place orders.
+Run `python -m unittest discover -s tests -v`, `node tests/test_ui.cjs` and `node --check static/app.js`. The UI test simulates DOM interactions; browser layout and live provider calls have not been verified. Tests use simulated Swiggy responses; they do not authenticate, mutate a live cart, call Gemini or place orders.
 
 ## References
 

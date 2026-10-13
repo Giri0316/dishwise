@@ -43,7 +43,7 @@ class QuoteProvider:
         if name=="get_food_cart":return {"success":True,"data":copy.deepcopy(self.basket)}
         if name=="search_menu":return {"items":[menu("1", "Masala Dosai" if self.change else "Plain Dosai")],"hasMore":False}
         if name=="update_food_cart":
-            self.basket={"cart_id":42,"items":[{"menu_item_id":"101","quantity":1,"name":"Plain Dosai","in_stock":1,"addons":[],"variants":[]}],"pricing":{"item_total":115,"delivery_charge":0,"taxes_and_charges":31.08,"to_pay":146},"offers":{"coupon_applied":"SUGGESTED","coupon_discount":0}}
+            self.basket={"cart_id":42,"items":[{"menu_item_id":"101","quantity":1,"name":"Plain Dosai","in_stock":1,"addons":[],"variants":[]}],"pricing":{"item_total":115,"delivery_charge":0,"taxes_and_charges":31.08,"to_pay":146},"offers":{"coupon_applied":None,"coupon_discount":0}}
             return {"success":True}
         if name=="fetch_food_coupons":return {"coupon_sections":[{"title":"More offers","coupons":[{"title":"SAVE20","applicable":True},{"code":"SAVE30","applicabilityStatus":"APPLICABLE"}]}] if self.coupons else [],"summary":{"filter_applied":"COD only"}}
         if name=="apply_food_coupon":
@@ -88,6 +88,137 @@ class LiveTests(unittest.TestCase):
         self.assertIsNone(client.basket)
         self.assertEqual(r["_bill_diagnostic"]["initial_cart"]["pricing"]["to_pay"],146)
         self.assertLessEqual(client.calls,36)
+    def test_cheapest_40_distinct_restaurants_after_filtering(self):
+        class Provider:
+            def call(self, name, args):
+                self.assert_unscoped(args)
+                if name == "search_restaurants":
+                    return {"restaurants":[{"id":str(i),"name":f"Restaurant {i}","distanceKm":7 if i == 60 else 2,"availabilityStatus":"CLOSED" if i == 59 else "OPEN"} for i in range(1,61)],"hasMore":False}
+                return {"items":[menu(str(i),price=1000-i) for i in range(1,61)] + [menu("45",item_id="cheap45",price=10),menu("58","Masala Dosa",item_id="wrong",price=1),menu("57",item_id="unknown",price=None)],"hasMore":False}
+            def assert_unscoped(self,args):
+                assert "restaurantIdOfAddedItem" not in args, "Discovery must never crawl every restaurant menu"
+        run=new_search("Plain Dosa",2,"addr")
+        for _ in range(80):
+            step(run,Provider())
+            if run["done"]:break
+        rows=list(run["offers"].values())
+        self.assertEqual(len(rows),40)
+        self.assertEqual(len({r["restaurant_id"] for r in rows}),40)
+        self.assertEqual(rows[0]["item_id"],"cheap45")
+        expected=["45"]+[str(i) for i in range(58,0,-1) if i != 45][:39]
+        self.assertEqual([r["restaurant_id"] for r in rows],expected)
+        self.assertEqual([r["item_total"] for r in rows],sorted(r["item_total"] for r in rows))
+        self.assertTrue(all(r["menu_offset"]==0 for r in rows))
+        self.assertLess(run["pages"],10)
+
+    def test_endless_provider_has_firm_page_limit(self):
+        class Endless:
+            def call(self,name,args):
+                offset=args.get("offset",0)
+                if name=="search_restaurants":
+                    return {"restaurants":[{"id":str(offset+1),"name":f"Restaurant {offset+1}","distanceKm":2,"availabilityStatus":"OPEN"}],"hasMore":True,"nextOffset":offset+1}
+                return {"items":[menu(str(offset+1),price=100-offset)],"hasMore":True,"nextOffset":offset+1}
+        run=new_search("Plain Dosa",1,"addr")
+        for _ in range(90):
+            step(run,Endless())
+            if run["done"]:break
+        self.assertTrue(run["done"])
+        self.assertLessEqual(run["pages"],64)
+        self.assertLessEqual(run["menu_pages"],20)
+        self.assertTrue(run["partial"])
+
+    def test_time_limit_preserves_collected_known_matches(self):
+        run=new_search("Plain Dosa",1,"addr")
+        provider=DiscoveryProvider()
+        step(run,provider);step(run,provider)
+        run["started_at"]-=130
+        step(run,provider)
+        self.assertTrue(run["done"])
+        self.assertTrue(run["offers"])
+        self.assertEqual(run["stop_reason"],"discovery_limit")
+
+    def test_best_and_more_coupons_checked_without_optional_filter(self):
+        class Provider(QuoteProvider):
+            def call(self,name,args):
+                if name=="fetch_food_coupons":
+                    self.calls+=1
+                    return {"coupon_sections":[{"title":"Best coupon","coupons":[{"title":"SAVE20","applicable":True}]},{"title":"More offers","coupons":[{"couponCode":"SAVE30","applicabilityStatus":"APPLICABLE"}]}],"summary":{}}
+                return super().call(name,args)
+        provider=Provider()
+        result=quote_offer(provider,menu_offers({"items":[menu("1")]},1)[0],"addr",True)
+        self.assertEqual(result["offer"]["coupon"],"SAVE30")
+        self.assertEqual(result["offer"]["coupon_checks"]["codes_tested"],["SAVE20","SAVE30"])
+        self.assertEqual(result["offer"]["status"],"verified")
+
+    def test_cart_suggested_coupon_is_attempted_and_verified(self):
+        class Provider(QuoteProvider):
+            def call(self,name,args):
+                response=super().call(name,args)
+                if name=="update_food_cart":self.basket["offers"]["coupon_applied"]="SAVE30"
+                return response
+        provider=Provider(coupons=False)
+        result=quote_offer(provider,menu_offers({"items":[menu("1")]},1)[0],"addr",True)
+        self.assertEqual(result["offer"]["coupon"],"SAVE30")
+        self.assertEqual(result["offer"]["discount"],30)
+        self.assertIsNone(provider.basket)
+
+    def test_coupon_lookup_failure_is_not_a_finished_deal(self):
+        class Provider(QuoteProvider):
+            def call(self,name,args):
+                if name=="fetch_food_coupons":raise AppError("Unavailable",502)
+                return super().call(name,args)
+        provider=Provider()
+        result=quote_offer(provider,menu_offers({"items":[menu("1")]},1)[0],"addr",True)
+        self.assertEqual(result["offer"]["status"],"coupon_unverified")
+        self.assertTrue(result["offer"]["bill_verified"])
+        self.assertEqual(result["offer"]["total"],146)
+        self.assertIsNone(provider.basket)
+
+    def test_coupon_not_actually_applied_is_not_verified(self):
+        class Provider(QuoteProvider):
+            def call(self,name,args):
+                if name=="apply_food_coupon":
+                    self.calls+=1
+                    return {"success":True}
+                return super().call(name,args)
+        provider=Provider()
+        result=quote_offer(provider,menu_offers({"items":[menu("1")]},1)[0],"addr",True)
+        self.assertEqual(result["offer"]["status"],"coupon_unverified")
+        self.assertEqual(result["offer"]["discount"],0)
+        self.assertEqual(result["offer"]["coupon_checks"]["failed_codes"],["SAVE20","SAVE30"])
+        self.assertIsNone(provider.basket)
+
+    def test_payment_and_ineligible_codes_are_excluded(self):
+        sections=[{"title":"Best coupon","coupons":[{"code":"YES20","applicable":True},{"code":"NO30","applicable":False},{"code":"BANK40","applicable":True,"description":"Use a credit card"}]},{"title":"Payment offers","coupons":[{"code":"PAY50","applicable":True}]}]
+        self.assertEqual(coupon_candidates(sections,False)[0],["YES20"])
+
+    def test_coupon_budget_is_disclosed_and_cleanup_reserved(self):
+        class Provider(QuoteProvider):
+            def call(self,name,args):
+                if name=="fetch_food_coupons":
+                    self.calls+=1
+                    return {"coupon_sections":[{"title":"Best coupons","coupons":[{"code":f"SAVE{i}","applicable":True} for i in range(30)]}]}
+                return super().call(name,args)
+        provider=Provider()
+        result=quote_offer(provider,menu_offers({"items":[menu("1")]},1)[0],"addr",True)
+        self.assertLessEqual(provider.calls,36)
+        self.assertFalse(result["offer"]["coupon_checks"]["all_candidates_tested"])
+        self.assertEqual(result["offer"]["status"],"coupon_unverified")
+        self.assertIsNone(provider.basket)
+
+    def test_mcp_session_reuse_skips_repeated_initialization(self):
+        import httpx,json
+        from swiggy import SwiggyClient
+        messages=[]
+        def handler(request):
+            self.assertEqual(request.headers["Mcp-Session-Id"],"session-test")
+            message=json.loads(request.content);messages.append(message)
+            return httpx.Response(200,json={"jsonrpc":"2.0","id":message["id"],"result":{"structuredContent":{"items":[]}}})
+        with SwiggyClient("fake",transport=httpx.MockTransport(handler)) as client:
+            client.resume_session({"id":"session-test","protocol":"2025-03-26"})
+            self.assertEqual(client.call("search_menu",{"addressId":"addr","query":"dosa"}),{"items":[]})
+            self.assertEqual(client.session_info()["id"],"session-test")
+        self.assertEqual([m["method"] for m in messages],["tools/call"])
     def test_empty_coupon_response_does_not_invent_discount(self):
         offer=menu_offers({"items":[menu("1")]},1)[0]
         client=QuoteProvider(coupons=False);r=quote_offer(client,offer,"addr",True)

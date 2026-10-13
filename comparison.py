@@ -4,6 +4,7 @@ import re
 from copy import deepcopy
 from swiggy import AppError
 from matching import customization_reason, exact_dish
+from coupons import coupon_plan, coupon_candidates
 
 
 def number(value):
@@ -151,34 +152,26 @@ def check_address(client, address_id):
     raise AppError("Choose an address saved in your own Swiggy account.", 403)
 
 
-def coupon_candidates(sections, cod_filtered):
-    """Prefer Best coupon cards; only use explicit codes or code-only titles."""
-    valid_sections = [section for section in sections if isinstance(section, dict)]
-    best_sections = [section for section in valid_sections
-                     if "best" in (str(section.get("title", "")) + " " + str(section.get("type", ""))).lower()]
-    chosen = best_sections or [section for section in valid_sections
-                               if "payment" not in (str(section.get("title", "")) + " " + str(section.get("type", ""))).lower()]
-    codes = []
-    for section in chosen:
-        cards = section.get("coupons", [])
-        if not isinstance(cards, list):
-            continue
-        for card in cards:
-            if not isinstance(card, dict):
-                continue
-            status = str(card.get("applicabilityStatus", "")).upper()
-            if card.get("applicable") is False or status == "NOT_APPLICABLE":
-                continue
-            if not cod_filtered or not (card.get("applicable") is True or status in {"APPLICABLE", "APPLIED"}):
-                continue
-            code = card.get("couponCode") or card.get("coupon_code") or card.get("code")
-            # Some documented cards expose their coupon code as the title.
-            if not isinstance(code, str) or not code.strip():
-                title = card.get("title")
-                code = title if isinstance(title, str) and re.fullmatch(r"[A-Z][A-Z0-9_-]{2,39}", title) else None
-            if isinstance(code, str) and code.strip() and code.strip() not in codes:
-                codes.append(code.strip())
-    return codes, bool(best_sections)
+def refresh_offer(client, offer, address_id):
+    """Look up the exact selected ID in at most four scoped menu pages."""
+    offset, seen = 0, set()
+    for _ in range(4):
+        payload = data_of(client.call("search_menu", {"addressId": address_id,
+            "query": offer["dish"], "offset": offset, "restaurantIdOfAddedItem": offer["restaurant_id"]}))
+        rows = menu_offers(payload, offer["quantity"], offer["restaurant_id"], offer["restaurant"])
+        exact = next((row for row in rows if row["id"] == offer["id"]), None)
+        if exact is not None:
+            if exact["customized"] or not exact_dish(exact["dish"], offer["dish"]):
+                break
+            return {**offer, **exact, "needs_menu_detail": False}
+        cursor = payload.get("nextOffset")
+        if isinstance(cursor, str) and cursor.isdecimal():
+            cursor = int(cursor)
+        if payload.get("hasMore") is False or type(cursor) is not int or cursor < 0 or cursor == offset or cursor in seen:
+            break
+        seen.add(offset)
+        offset = cursor
+    raise AppError("The exact dish is unavailable or needs a size/add-on choice. Its bill was not checked.", 409)
 
 
 def quote_offer(client, offer, address_id, replace_existing_cart=False):
@@ -200,13 +193,7 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
         elif parse_cart(client.call("get_food_cart", cart_args)) is not None:
             raise AppError("Your Swiggy cart has items. Allow cart replacement before comparing full bills.", 409)
         safe_to_continue = True
-        refreshed = menu_offers(client.call("search_menu", {"addressId": address_id,
-            "query": offer.get("menu_query", offer["dish"]), "offset": offer.get("menu_offset", 0), "restaurantIdOfAddedItem": offer["restaurant_id"]}),
-            offer["quantity"], restaurant_id=offer["restaurant_id"], restaurant_name=offer["restaurant"])
-        exact = next((row for row in refreshed if row["id"] == offer["id"]), None)
-        if not exact or exact["customized"] or not exact_dish(exact["dish"], offer["dish"]):
-            raise AppError("This dish is unavailable or requires a size/add-on choice. Its bill was not checked.", 409)
-        offer = {**offer, **exact}
+        offer = refresh_offer(client, offer, address_id)
         safe_to_continue = False
         # Recheck after the menu call to avoid overwriting an intervening cart edit.
         if parse_cart(client.call("get_food_cart", cart_args)) is not None:
@@ -233,11 +220,11 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
             coupon_warning = "Coupon lookup could not be completed; additional savings are unverified."
         cards = [c for section in sections if isinstance(section, dict)
                  for c in (section.get("coupons") if isinstance(section.get("coupons"), list) else []) if isinstance(c, dict)]
-        filter_text = str((coupons.get("summary") or {}).get("filter_applied", "")).lower()
-        cod = "cod" in filter_text or "cash on delivery" in filter_text
-        candidates, best_section_found = coupon_candidates(sections, cod)
+        plan = coupon_plan(sections, (cart.get("offers") or {}).get("coupon_applied"))
+        candidates, best_section_found = plan["codes"], plan["best_section"]
         checked, confirmed_codes = [], []
         stopped_early = False
+        application_failed = False
         for code in candidates:
             # Leave enough RPC capacity for the pre-check, application,
             # verification and three cleanup calls. Never retry a mutation.
@@ -261,6 +248,8 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
             checked.append(code)
             if bill["coupon"] == code and bill["discount"] > 0:
                 confirmed_codes.append(code)
+            else:
+                application_failed = True
             if bill["coupon"] == code and (bill["discount"], -bill["total"]) > (best["discount"], -best["total"]):
                 best = bill
                 best_cart = deepcopy(cart)
@@ -268,6 +257,10 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
                 # Preserve the verified bill and stop after an uncertain call.
                 stopped_early = True
                 break
+        coupon_complete = not (coupon_warning or stopped_early or plan["unresolved_cards"] or application_failed)
+        best["bill_verified"] = True
+        best["status"] = "verified" if coupon_complete else "coupon_unverified"
+        best["coupon_status"] = ("applied" if best["discount"] > 0 else "none_available") if coupon_complete else "verification_incomplete"
         best["coupon_checks"] = {
             "codes_tested": checked,
             "confirmed_codes": confirmed_codes,
@@ -275,6 +268,9 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
             "candidate_count": len(candidates),
             "all_candidates_tested": not stopped_early and len(checked) == len(candidates),
             "availability": "lookup_failed" if coupon_warning else "none_returned" if not cards else "returned",
+            "complete": coupon_complete,
+            "unresolved_cards": plan["unresolved_cards"],
+            "failed_codes": [code for code in checked if code not in confirmed_codes],
         }
         if best.get("coupon") and best["discount"] > 0:
             best["coupon_note"] = (
@@ -289,9 +285,15 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
         if coupon_warning:
             best["coupon_note"] = coupon_warning
         if not best_section_found:
-            best["coupon_note"] += " No Best coupon section was returned; other eligible returned offers were considered."
+            best["coupon_note"] += " No Best section was returned; available coupon codes and cart suggestions were checked."
         elif not candidates:
-            best["coupon_note"] += " The Best coupon section contained no usable eligible coupon codes."
+            best["coupon_note"] += " No usable eligible coupon codes were returned."
+        if plan["unresolved_cards"]:
+            best["coupon_note"] += f" {plan['unresolved_cards']} coupon cards did not expose a usable code."
+        if application_failed:
+            best["coupon_note"] += " Swiggy did not confirm positive savings for every attempted code."
+        if not coupon_complete:
+            best["coupon_note"] += " Coupon verification is incomplete; this bill is excluded from the lowest-price ranking."
         if not best["coupon_checks"]["all_candidates_tested"]:
             best["coupon_note"] += " Some candidates were not tested; maximum savings are unverified."
         if best.get("free_delivery_applied"):

@@ -252,7 +252,9 @@ def search():
     try:
         with client_factory(token()) as client:
             check_address(client, address_id)
+            mcp_session = client.session_info() if hasattr(client, "session_info") else None
         run = new_search(dish, count, address_id)
+        run["mcp_session"] = mcp_session
         state()["search"] = run
         return jsonify(public_search(run))
     finally:
@@ -269,7 +271,13 @@ def search_next():
         current["busy"] = True
     try:
         with client_factory(access) as client:
-            discovery_step(current, client)
+            if hasattr(client, "resume_session"):
+                client.resume_session(current.get("mcp_session"))
+            try:
+                discovery_step(current, client)
+            finally:
+                if hasattr(client, "session_info"):
+                    current["mcp_session"] = client.session_info()
         return jsonify(public_search(current))
     finally:
         with state_lock:
@@ -289,15 +297,21 @@ def quote():
         raise AppError("Search again before checking this bill.", 409)
     if not exact_dish(offer["dish"], current["dish"]) or not 0 <= offer.get("distance_km", 999) < 7:
         raise AppError("This item does not match the confirmed dish and distance filter.", 409)
-    if offer["customized"]:
+    if offer["customized"] and not offer.get("needs_menu_detail"):
         raise AppError("This dish requires a customization. Check it in Swiggy.", 409)
     if not cart_lock.acquire(blocking=False):
         raise AppError("A cart check is already running. Wait for it to finish.", 409)
     try:
         with client_factory(token()) as client:
+            if hasattr(client, "resume_session"):
+                client.resume_session(current.get("mcp_session"))
             check_address(client, current["address_id"])
-            result = quote_offer(client, offer, current["address_id"],
-                                 replace_existing_cart=data.get("replace_existing_cart") is True)
+            try:
+                result = quote_offer(client, offer, current["address_id"],
+                                     replace_existing_cart=data.get("replace_existing_cart") is True)
+            finally:
+                if hasattr(client, "session_info"):
+                    current["mcp_session"] = client.session_info()
         captured = result.pop("_bill_diagnostic", None)
         if captured is not None:
             # Captured for searched offers only; discarded with the search.

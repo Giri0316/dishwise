@@ -63,6 +63,19 @@ class SwiggyClient:
     def __exit__(self, *args):
         self.client.close()
 
+    def resume_session(self, saved):
+        """Reuse only this authenticated search's server-issued MCP session."""
+        if (isinstance(saved, dict) and isinstance(saved.get("id"), str)
+                and saved["id"] and isinstance(saved.get("protocol"), str)):
+            self.client.headers["Mcp-Session-Id"] = saved["id"]
+            self.client.headers["MCP-Protocol-Version"] = saved["protocol"]
+            self.started = True
+
+    def session_info(self):
+        sid = self.client.headers.get("Mcp-Session-Id")
+        protocol = self.client.headers.get("MCP-Protocol-Version")
+        return {"id": sid, "protocol": protocol} if self.started and sid and protocol else None
+
     def rpc(self, method, params, notification=False):
         self.calls += 1
         if self.calls > 36 or time.monotonic() > self.deadline:
