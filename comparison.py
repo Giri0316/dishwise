@@ -19,47 +19,157 @@ def data_of(payload):
 
 
 def parse_cart(payload, allow_out_of_stock=False):
-    """Accept the documented envelope and observed raw gateway responses."""
-    if not isinstance(payload, dict):
-        raise AppError("Cart response was not recognized.", 502)
-    confirmed = False
-    current = payload
-    for _ in range(3):
-        if current.get("success") is False or current.get("successful") is False:
-            raise AppError("Cart state could not be confirmed.", 502)
-        if "statusCode" in current and (type(current["statusCode"]) is not int or current["statusCode"] != 0):
-            # Observed statuses 6 and 8 include populated unavailable baskets.
-            # Recognize it only for an authorized clear or our own cleanup;
-            # it must never be accepted as a purchasable/verified bill.
-            value = current.get("data")
-            stock_basket = (type(current.get("statusCode")) is int and current["statusCode"] in (6, 8)
-                            and isinstance(value, dict) and value.get("result") == "success"
-                            and isinstance(value.get("items"), list) and bool(value["items"])
-                            and all(isinstance(item, dict) for item in value["items"])
-                            and (current["statusCode"] == 6 or any(item.get("in_stock") in (False, 0) for item in value["items"])))
-            if not stock_basket:
-                raise AppError("Cart state could not be confirmed. No new item was added.", 502)
-            if not allow_out_of_stock:
-                raise AppError("Swiggy reports a closed restaurant or out-of-stock cart items; this bill cannot be confirmed.", 409)
-            confirmed = True
-        confirmed = confirmed or current.get("success") is True or current.get("successful") is True
-        status_ok = type(current.get("statusCode")) is int and current["statusCode"] == 0
-        if "data" not in current:
-            raise AppError("Cart response is missing data. Nothing was cleared.", 502)
-        value = current["data"]
+    """Separate basket identity from whether its current bill is usable.
+
+    `allow_out_of_stock` is used ONLY for cleanup: explicit item identities
+    can still be inspected under a service error. Such responses never prove
+    emptiness and are never used as price quotes.
+    """
+    current, confirmed, failed = payload, False, False
+    for _ in range(7):
+        if not isinstance(current, dict):
+            break
+        failed = failed or current.get("success") is False or current.get("successful") is False
+        code = current.get("statusCode")
+        if code is not None and (type(code) is not int or code != 0):
+            failed = True
+        confirmed = (confirmed or current.get("success") is True
+                     or current.get("successful") is True or current.get("result") == "success"
+                     or (type(code) is int and code == 0))
+        if "items" in current:
+            items = current["items"]
+            if not isinstance(items, list) or any(not isinstance(i, dict) for i in items):
+                break
+            if not items:
+                count = current.get("item_count")
+                if confirmed and not failed and count in (None, 0):
+                    return None
+                break
+            if failed and not allow_out_of_stock:
+                raise AppError("Swiggy returned an unavailable cart; its bill cannot be verified.", 409,
+                               code="cart_unavailable")
+            if confirmed or (allow_out_of_stock and failed):
+                return current
+            break
+        key = "response" if isinstance(current.get("response"), dict) else "data"
+        if key not in current:
+            break
+        value = current[key]
         if value is None:
-            # The raw empty-cart gateway format identifies this as CART.
-            if confirmed or (status_ok and current.get("statusMessage") == "CART"):
+            if confirmed and not failed:
                 return None
-            raise AppError("Empty cart state could not be confirmed. Nothing was cleared.", 502)
-        if not isinstance(value, dict):
-            raise AppError("Cart response was not recognized. Nothing was cleared.", 502)
-        if isinstance(value.get("items"), list):
-            if confirmed or (status_ok and value.get("result") == "success"):
-                return value if value["items"] else None
-            raise AppError("Cart state could not be confirmed.", 502)
+            break
         current = value
-    raise AppError("Cart response was not recognized. Review your cart in Swiggy.", 502)
+    raise AppError("Swiggy did not return a recognizable cart state.", 502, code="cart_format")
+
+
+def cart_summary(payload):
+    """Allowlist diagnostic structure; exclude tokens, addresses and free text."""
+    summary = {"layers": []}
+    current = payload
+    for _ in range(7):
+        if not isinstance(current, dict):
+            summary["terminal_type"] = type(current).__name__
+            break
+        layer = {"keys": sorted(str(k) for k in current)[:35]}
+        for key in ("statusCode", "success", "successful", "result", "item_count"):
+            value = current.get(key)
+            if isinstance(value, (bool, int, float)) or (key == "result" and value in ("success", "failure")):
+                layer[key] = value
+        summary["layers"].append(layer)
+        if isinstance(current.get("items"), list):
+            summary["items"] = [{k: item[k] for k in ("menu_item_id", "quantity", "in_stock")
+                                 if k in item and isinstance(item[k], (str, int, bool))}
+                                for item in current["items"][:10] if isinstance(item, dict)]
+            break
+        key = "response" if isinstance(current.get("response"), dict) else "data"
+        if key not in current:
+            break
+        current = current[key]
+    return summary
+
+
+def cart_identity_matches(cart, offer):
+    """Cleanup ownership uses IDs/quantity/options, never mutable display names."""
+    if not isinstance(cart, dict):
+        return False
+    restaurant = cart.get("restaurant") or {}
+    if not isinstance(restaurant, dict):
+        return False
+    rid = restaurant.get("id") or cart.get("restaurant_id")
+    if rid is not None and str(rid) != str(offer["restaurant_id"]):
+        return False
+    items = cart.get("items")
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        return False
+    item = items[0]
+    return (str(item.get("menu_item_id", "")) == str(offer["item_id"])
+            and type(item.get("quantity")) is int and item["quantity"] == offer["quantity"]
+            and all(item.get(key) in (None, []) for key in ("variants", "variations", "variantsV2", "addons")))
+
+
+def read_cart(client, args, trace, phase, cleanup=False):
+    try:
+        payload = client.call("get_food_cart", args)
+        entry = {"phase": phase, "response": cart_summary(payload)}
+        trace.append(entry)
+        cart = parse_cart(payload, allow_out_of_stock=cleanup)
+        entry["state"] = "empty" if cart is None else "populated"
+        return cart
+    except AppError as exc:
+        trace.append({"phase": phase, "error_code": exc.code, "status": exc.status})
+        raise
+
+
+def clear_and_confirm(client, args, trace, offer=None):
+    """At most two clears. Reconcile a lost acknowledgement before retrying.
+
+    Setup has explicit replace-cart consent. Cleanup only clears the test
+    basket and rechecks its identity before any subsequent clear.
+    """
+    import time
+    retry_until = time.monotonic() + 30
+    if offer is not None:
+        cart = read_cart(client, args, trace, "cleanup.inspect", cleanup=True)
+        if cart is None:
+            return True
+        if not cart_identity_matches(cart, offer):
+            raise AppError("The cart contains different items. They were preserved.", 409, code="cart_changed")
+    for attempt in range(2):
+        clear_error = None
+        try:
+            response = client.call("flush_food_cart", {})
+            trace.append({"phase": "clear", "attempt": attempt+1, "response": cart_summary(response)})
+        except AppError as exc:
+            clear_error = exc
+            trace.append({"phase": "clear", "attempt": attempt+1, "error_code": exc.code, "status": exc.status})
+            if exc.status == 401 or exc.code == "mcp_session_expired":
+                raise
+            if exc.status == 429:
+                delay = exc.retry_after if exc.retry_after is not None else 30
+                if time.monotonic()+delay >= retry_until:
+                    raise
+                if not hasattr(client, "cooldown_until"):
+                    time.sleep(delay)
+        # A timeout/error may follow a successful clear. The read decides.
+        cart = read_cart(client, args, trace, "clear.verify", cleanup=True)
+        if cart is None:
+            return True
+        if offer is not None and not cart_identity_matches(cart, offer):
+            raise AppError("The cart changed during cleanup. Different items were preserved.", 409, code="cart_changed")
+        if clear_error is not None and not clear_error.retryable:
+            raise clear_error
+        if attempt == 0 and time.monotonic()+.5 < retry_until:
+            time.sleep(.5)
+            # Allow one delayed read before retrying the idempotent clear.
+            cart = read_cart(client, args, trace, "clear.settle", cleanup=True)
+            if cart is None:
+                return True
+            if offer is not None and not cart_identity_matches(cart, offer):
+                raise AppError("The cart changed during cleanup. Different items were preserved.", 409, code="cart_changed")
+        else:
+            break
+    raise AppError("Swiggy still returned items after two clear attempts.", 409, code="cart_not_empty")
 
 
 def exact_basket(cart, offer):
@@ -181,31 +291,37 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
     attempted, empty, best, failure = False, False, None, None
     safe_to_continue = False
     existing_cart_cleared = False
+    trace = []
+    initial_cart = best_cart = coupons = None
+    phase = "reset"
+    cleanup_error = None
     try:
         if replace_existing_cart is True:
             # Cart removal has been explicitly authorized. Reset first so
             # a closed restaurant/out-of-stock old basket cannot block it.
             # A failure or unknown empty-state response stops before add.
-            client.call("flush_food_cart", {})
-            if parse_cart(client.call("get_food_cart", cart_args)) is not None:
-                raise AppError("Swiggy did not confirm an empty cart after clearing. No comparison item was added.", 409)
+            clear_and_confirm(client, cart_args, trace)
             existing_cart_cleared = True
         elif parse_cart(client.call("get_food_cart", cart_args)) is not None:
             raise AppError("Your Swiggy cart has items. Allow cart replacement before comparing full bills.", 409)
         safe_to_continue = True
+        phase = "menu_refresh"
         offer = refresh_offer(client, offer, address_id)
         safe_to_continue = False
         # Recheck after the menu call to avoid overwriting an intervening cart edit.
         if parse_cart(client.call("get_food_cart", cart_args)) is not None:
             raise AppError("Your cart changed before the check. Existing items were preserved.", 409)
+        phase = "add_item"
         attempted = True
         client.call("update_food_cart", {**cart_args, "restaurantId": offer["restaurant_id"],
             "cartItems": [{"menu_item_id": offer["item_id"], "quantity": offer["quantity"]}]})
-        cart = parse_cart(client.call("get_food_cart", cart_args))
+        phase = "read_bill"
+        cart = read_cart(client, cart_args, trace, phase)
         require_exact(cart, offer)
         best = read_bill(offer, cart)
         initial_cart = deepcopy(cart)
         best_cart = deepcopy(cart)
+        phase = "coupons"
         coupon_warning = None
         try:
             coupons = data_of(client.call("fetch_food_coupons", {"addressId": address_id, "restaurantId": offer["restaurant_id"]}))
@@ -226,8 +342,8 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
         stopped_early = False
         application_failed = False
         for code in candidates:
-            # Leave enough RPC capacity for the pre-check, application,
-            # verification and three cleanup calls. Never retry a mutation.
+            # Stop adding coupon work near the main limit. Cleanup has its
+            # own allowance, including when read retries used the main budget.
             if getattr(client, "calls", 0) + 6 > 36:
                 stopped_early = True
                 break
@@ -302,26 +418,31 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
         failure = exc
     finally:
         if attempted:
-            # Cleanup has its own bounded deadline, even when the main request failed.
-            if hasattr(client, "deadline"):
-                import time
-                client.deadline = time.monotonic() + 80
+            if hasattr(client, "begin_cleanup"):
+                client.begin_cleanup()
             try:
-                cart = parse_cart(client.call("get_food_cart", cart_args), allow_out_of_stock=True)
-                if cart is None:
-                    empty = True
-                else:
-                    require_exact(cart, offer)
-                    client.call("flush_food_cart", {})
-                    empty = parse_cart(client.call("get_food_cart", cart_args)) is None
-            except Exception:
+                empty = clear_and_confirm(client, cart_args, trace, offer)
+            except Exception as exc:
+                cleanup_error = exc
                 empty = False
+    diagnostic = {"phase": phase, "cart_empty_after_check": empty,
+                  "trace": trace, "rpc_events": getattr(client, "events", []),
+                  "initial_cart": initial_cart, "best_cart": best_cart,
+                  "coupon_response": coupons,
+                  "original_error": getattr(failure, "code", None),
+                  "cleanup_error": getattr(cleanup_error, "code", None)}
     if attempted and not empty:
-        raise AppError("Cart cleanup could not be confirmed. Stop and check your cart in Swiggy before continuing.", 409)
+        reason = str(cleanup_error) if isinstance(cleanup_error, AppError) else "Unexpected cleanup failure."
+        error = AppError("Cart cleanup could not be confirmed: " + reason, 409, code="cleanup_failed")
+        error.diagnostic = diagnostic
+        error.safe_to_continue = False
+        error.partial_offer = best
+        raise error
     if failure:
-        if isinstance(failure, AppError):
-            failure.safe_to_continue = (empty if attempted else safe_to_continue) and failure.status not in (401, 429)
+        if not isinstance(failure, AppError):
+            failure = AppError("The bill check encountered an unexpected response.", 502, code="unexpected_response")
+        failure.diagnostic = diagnostic
+        failure.safe_to_continue = (empty if attempted else safe_to_continue) and failure.status not in (401, 429)
         raise failure
     return {"offer": best, "cart_empty": empty, "existing_cart_cleared": existing_cart_cleared,
-            "_bill_diagnostic": {"initial_cart": initial_cart, "best_cart": best_cart,
-                                 "coupon_response": coupons}}
+            "_bill_diagnostic": diagnostic}

@@ -3,6 +3,7 @@ const fs = require('fs');
 const vm = require('vm');
 const assert = require('assert');
 const base = require('path').resolve(__dirname, '..') + '/';
+const recoveryFailure = process.env.RECOVERY_FAILURE === '1';
 const html = fs.readFileSync(base + 'templates/index.html', 'utf8');
 class Element {
   constructor() { this.children=[]; this.hidden=false; this.disabled=false; this.value=''; this.textContent=''; this.innerHTML=''; this.dataset={}; }
@@ -35,6 +36,7 @@ const context=vm.createContext({Intl,URLSearchParams,console,
     else if(path==='/api/search/next') {pages++;data=response();}
     else if(path==='/api/quote') {
       quotes++;quoteOrder.push(body.offer_id);assert.equal(body.replace_existing_cart,true);assert.equal(body.search_id,'s');
+      if (recoveryFailure && quotes === 2) return {ok:false,json:async()=>({error:'Cart cleanup could not be confirmed: Swiggy still returned items after two clear attempts.',safe_to_continue:false,diagnostic_url:'/api/debug/cleanup'})};
       const offer=sourceOffers.find(o=>o.id===body.offer_id);assert(offer);
       data={cart_empty:true,offer:{...offer,status:offer.restaurant_id==='40'?'coupon_unverified':'verified',bill_verified:true,delivery:0,other_charges:31.08,total:146-Number(offer.restaurant_id),coupon_note:'No coupon codes returned.',coupon_checks:{availability:'none_returned'}}};
     } else throw Error(`Unexpected API call: ${path}`);
@@ -49,6 +51,15 @@ const context=vm.createContext({Intl,URLSearchParams,console,
   assert(elements['dish-dialog'].open);
   elements['dish-choices'].children[0].onclick();
   await elements['confirm-dish'].onclick();
+  if (recoveryFailure) {
+    assert.equal(quotes,2); assert(!elements.error.hidden);
+    assert(!elements['error-details'].hidden); assert(elements.resume.hidden);
+    assert(elements.results.innerHTML.includes('Bill unavailable'));
+    assert(elements.footnote.textContent.startsWith('1 of 40'));
+    assert(!elements.find.disabled);
+    console.log('PASS: unresolved cleanup stops subsequent quotes, preserves completed results and exposes saved error details.');
+    return;
+  }
   assert.equal(quotes,40);assert.equal(pages,2);
   assert.equal((elements.results.innerHTML.match(/<article /g)||[]).length,40);
   assert.equal(elements.results.innerHTML.match(/<h3>(.*?)<\/h3>/)[1],'Restaurant 39');

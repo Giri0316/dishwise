@@ -5,7 +5,8 @@ import re
 def code_of(card):
     for field in ("couponCode", "coupon_code", "code"):
         code = card.get(field)
-        if isinstance(code, str) and 0 < len(code.strip()) <= 100:
+        if (isinstance(code, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{2,39}", code.strip())
+                and not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", code.strip())):
             return code.strip()
     title = card.get("title", "")
     if isinstance(title, str) and re.fullmatch(r"[A-Z][A-Z0-9_-]{2,39}", title.strip()):

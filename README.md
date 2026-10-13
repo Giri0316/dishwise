@@ -6,7 +6,7 @@ This is the complete updated Python/Flask project for your existing Render servi
 
 1. Replace the project files with the contents of this folder. Preserve your existing secret environment settings. The main changed files are `app.py`, `comparison.py`, `swiggy.py`, `static/app.js`, `static/style.css`, and `templates/index.html`. Include `matching.py`, `discovery.py`, `ai_dishes.py` and the new `coupons.py` file. Replace the frontend and backend together.
 2. Commit/push and redeploy your existing Render service. Keep one Gunicorn worker because session data is stored in process memory. The included `render.yaml` preserves that setup.
-3. In Render → Environment, set `GEMINI_API_KEY` to your own Gemini API key and `GEMINI_MODEL` to a text model enabled for that key. `gemini-3.5-flash-lite` is an example from Google's current model catalog; use the model available to your account. Keys stay on the server. Do not put them in JavaScript or commit them.
+3. In Render → Environment, set `GEMINI_API_KEY` to your own Gemini API key and `GEMINI_MODEL` to a text model enabled for that key. Use a model available to your account. Keys stay on the server. Do not put them in JavaScript or commit them.
 4. Redeploy after changing environment settings, refresh Dishwise, and connect Swiggy again if the process restarted.
 
 The AI cannot be activated without your provider credentials. Without both variables, exact-name confirmation still works, with an explicit manual-mode message. AI failures fall back to manual choices. Only the typed food query is sent to Gemini; addresses, Swiggy credentials, carts and prices are not sent. Provider usage and billing depend on your Google account.
@@ -33,7 +33,7 @@ A fresh scoped item lookup checks the exact item ID, recipe and customization re
 
 Existing cart items are removed when bill checks begin and are not restored, as requested. The app verifies an empty cart, adds the selected item and quantity, reads prices/coupons, and then clears only the expected test basket. No ordering or payment tool is enabled. Leave the Swiggy cart unchanged during checks.
 
-Up to 40 full bills can still take several minutes: each uses actual cart calls. Stop waits for the current request and cleanup. Continue resumes remaining safe work. Authentication errors, provider rate limits and uncertain cleanup stop the run; no automatic cart-mutation retry is made. A search expires after 30 minutes of inactivity or four hours overall.
+Up to 40 full bills can still take several minutes: each uses actual cart calls. Stop waits for the current request and cleanup. Continue resumes remaining safe work. Authentication errors, provider rate limits and uncertain cleanup stop the run; a clear can be retried once after reading and checking the cart; item additions are never blindly replayed. A search expires after 30 minutes of inactivity or four hours overall.
 
 ## Coupon checks
 
@@ -46,14 +46,15 @@ Up to 40 full bills can still take several minutes: each uses actual cart calls.
 - Keep the largest confirmed coupon saving among checked candidates; use the lower final total to break a savings tie. All tax, delivery and payable values come from the cart response.
 - A failed coupon lookup, an available card without a usable code, an application without confirmed savings, or an exhausted test budget yields **Coupon verification incomplete**. The full bill remains visible but cannot win the cheapest-result ranking.
 
-Each restaurant retains a 36-RPC budget with capacity reserved for cleanup. All candidates are attempted when they fit; any untested candidate is disclosed. No unsupported claim of a guaranteed maximum discount is made.
+Each restaurant has a 36-RPC main budget. Cleanup receives a separate allowance of up to 12 additional RPCs and 60 seconds, even if the main budget was exhausted. Read retries are bounded and honor Retry-After; a cooldown longer than the recovery budget stops the run. All candidates are attempted when they fit; any untested candidate is disclosed. No unsupported claim of a guaranteed maximum discount is made.
 
 Your earlier Aruvi response returned an empty COD coupon list. If Swiggy returns neither a usable coupon code nor a cart suggestion, the app has nothing to apply. Item promotions and payment-specific discounts visible only in the mobile app cannot be manufactured. Prices are labeled as MCP quotes because mobile checkout may differ.
 
 ## Diagnostics
 
 - `/api/tools`: available gateway tools. This update requires `search_restaurants` in addition to the existing menu/cart/coupon tools.
-- `/api/debug/bill`: captured initial and winning cart fields before cleanup, for all completed matches in the current search.
+- `/api/debug/cleanup`: saved step-by-step traces for successful and failed checks, with error codes and redacted response structure. Reading it never calls Swiggy.
+- `/api/debug/bill`: captured initial and winning cart fields before cleanup, for completed matches and available partial snapshots from failed checks in the current search.
 - `/api/debug/bill?restaurant=Aruvi%20Veg%20Restaurant`: filter captures by exact restaurant name.
 - Existing menu/cart/coupon diagnostics remain available. Use `offer_id` to select a specific match.
 
@@ -73,3 +74,54 @@ Run `python -m unittest discover -s tests -v`, `node tests/test_ui.cjs` and `nod
 - https://mcp.swiggy.com/builders/docs/reference/food/apply_food_coupon/
 - https://ai.google.dev/api/generate-content
 - https://ai.google.dev/gemini-api/docs/models
+
+
+## Cart recovery revision — 2026-10-13
+
+The screenshot's generic cleanup error did not include the underlying exception.
+This release fixes reproducible failure paths; it cannot establish which one
+occurred in that live request retroactively.
+
+- Reconcile clear timeouts by reading the same MCP session. A lost acknowledgement
+  no longer automatically means the clear failed.
+- Allow a delayed empty-cart read, then at most one repeated clear. An unknown
+  response never counts as empty. Failed/null responses cannot prove emptiness.
+- During cleanup, identify the test item by restaurant/item ID, quantity and
+  options, independently of availability and mutable display names. Strict dish
+  matching still gates quotes. Different IDs, quantities or extras stop cleanup.
+- Handle nested and raw JSON cart formats, text-only clear acknowledgements,
+  and the final SSE frame without a trailing blank line.
+- Retry transient read failures with a bounded delay. Preserve authentication,
+  expired-session, rate-limit and local-budget errors separately. Do not change
+  MCP sessions during an uncertain cart transaction.
+- Save original and cleanup failures separately. An unresolved cleanup blocks
+  further quotes in that search. A new search may reset the cart under the
+  existing visible replacement consent.
+- Prefer a coupon's display code over a UUID in its code field. All savings still
+  require a returned applied code and a positive discount.
+
+Replace the full package, preserve Render secrets, and redeploy. Keep one worker
+and one instance; this version uses process-memory sessions and a process-local
+cart lock. The config endpoint returns build `cart-recovery-2026-10-13`.
+The added regression tests use injected HTTP/provider failures. They do not prove
+live Swiggy behavior or mobile price parity. The first live deployment check should
+use one exact dish; inspect `/api/debug/cleanup` if the provider still fails.
+
+## Research notes
+
+Reviewed the official get/update/flush cart and coupon references, production
+retry guidance and MCP transport specification. Also reviewed the public clients
+below, including their cart/probe functions and MCP transport code. No source
+code was copied from those projects. The toy comparator suppresses flush errors;
+that behavior was deliberately not adopted. The CLI preserves MCP sessions and
+handles JSON/SSE; its general 404 reinitialization is not used mid-cart because
+this app must preserve the session being cleaned up.
+
+- https://mcp.swiggy.com/builders/docs/reference/food/flush_food_cart/
+- https://mcp.swiggy.com/builders/docs/reference/food/get_food_cart/
+- https://mcp.swiggy.com/builders/docs/reference/food/update_food_cart/
+- https://mcp.swiggy.com/builders/docs/build/ship-to-production/
+- https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+- https://github.com/HKTITAN/swiggy-cli/blob/main/src/lib/mcp.ts
+- https://github.com/HKTITAN/swiggy-cli/blob/main/src/commands/food.ts
+- https://github.com/Atishyy27/swiggy-mcp-toy/blob/main/src/agent.mjs

@@ -144,7 +144,7 @@ def healthz():
 @app.get("/api/config")
 def config():
     current = state()
-    return jsonify(csrf=current["csrf"], ai_enabled=ai_ready(), connected=bool(current.get("token") and current.get("expires", 0) > time.time()))
+    return jsonify(build="cart-recovery-2026-10-13", csrf=current["csrf"], ai_enabled=ai_ready(), connected=bool(current.get("token") and current.get("expires", 0) > time.time()))
 
 
 @app.post("/api/auth/start")
@@ -265,8 +265,11 @@ def search():
 def search_next():
     access = token()
     current = search_run(body().get("search_id"))
+    if not cart_lock.acquire(blocking=False):
+        raise AppError("Wait for the current cart check to finish.", 409)
     with state_lock:
         if current["busy"]:
+            cart_lock.release()
             raise AppError("A search page is already loading.", 409)
         current["busy"] = True
     try:
@@ -282,14 +285,18 @@ def search_next():
     finally:
         with state_lock:
             current["busy"] = False
+        cart_lock.release()
 
 
 @app.post("/api/quote")
 def quote():
+    access = token()
     data = body()
     if data.get("consent") is not True:
         raise AppError("Confirm temporary cart use before checking bills.")
     current = search_run(data.get("search_id"))
+    if current.get("cart_blocked"):
+        raise AppError("This comparison stopped because cleanup was not confirmed. Start a new search to reset the cart.", 409)
     if not current.get("done"):
         raise AppError("Finish restaurant discovery before checking bills.", 409)
     offer = current.get("offers", {}).get(data.get("offer_id"))
@@ -302,7 +309,10 @@ def quote():
     if not cart_lock.acquire(blocking=False):
         raise AppError("A cart check is already running. Wait for it to finish.", 409)
     try:
-        with client_factory(token()) as client:
+        cached = current.get("quote_results", {}).get(offer["id"])
+        if cached:
+            return jsonify(cached)
+        with client_factory(access) as client:
             if hasattr(client, "resume_session"):
                 client.resume_session(current.get("mcp_session"))
             check_address(client, current["address_id"])
@@ -323,9 +333,21 @@ def quote():
                     **redact_diagnostic(captured),
                 }
         current.setdefault("quoted", {})[offer["id"]] = result["offer"]
+        current.setdefault("quote_results", {})[offer["id"]] = result
         return jsonify(result)
     except AppError as exc:
-        return jsonify(error=str(exc), safe_to_continue=getattr(exc, "safe_to_continue", False)), exc.status
+        diagnostic = getattr(exc, "diagnostic", None)
+        if diagnostic is not None:
+            current.setdefault("bill_diagnostics", {})[offer["id"]] = {
+                "restaurant": offer["restaurant"], "dish": offer["dish"],
+                "captured_at": time.time(), "error_code": exc.code,
+                **redact_diagnostic(diagnostic),
+            }
+        if exc.code == "cleanup_failed":
+            current["cart_blocked"] = True
+        return jsonify(error=str(exc), error_code=exc.code,
+                       diagnostic_url="/api/debug/cleanup" if diagnostic else None,
+                       safe_to_continue=getattr(exc, "safe_to_continue", False)), exc.status
     finally:
         cart_lock.release()
 
@@ -366,7 +388,8 @@ def list_swiggy_tools():
 def redact_diagnostic(value):
     """Remove authentication/session fields before exposing diagnostics."""
     sensitive = {"tid", "sid", "token", "access_token", "refresh_token",
-                 "authorization", "cookie", "set-cookie", "deviceid"}
+                 "authorization", "cookie", "set-cookie", "deviceid", "addressid", "address_id",
+                 "deliverysubtitle", "addressline", "phone", "email", "mcp-session-id"}
     if isinstance(value, dict):
         return {key: redact_diagnostic(item) for key, item in value.items()
                 if key.lower() not in sensitive}
@@ -392,6 +415,20 @@ def debug_bill():
         return jsonify(error="No captured bill for this selection. Run Find my deal and use a restaurant with a completed bill.",
                        available_restaurants=sorted({row["restaurant"] for row in captures.values()})), 404
     return jsonify(bills=redact_diagnostic(matches))
+
+
+@app.get("/api/debug/cleanup")
+def debug_cleanup():
+    """Saved trace of successful AND failed checks; does not contact Swiggy."""
+    token()
+    current = state().get("search", {})
+    if current.get("expires", 0) <= time.time():
+        raise AppError("Run Find my deal to capture fresh check details.", 409)
+    captures = current.get("bill_diagnostics", {})
+    return jsonify(build="cart-recovery-2026-10-13", checks=[{
+        key: row[key] for key in ("restaurant", "dish", "captured_at", "error_code", "phase",
+            "cart_empty_after_check", "trace", "rpc_events", "original_error", "cleanup_error") if key in row
+    } for row in captures.values()])
 
 
 def diagnostic_offer():
@@ -481,9 +518,13 @@ def debug_cart():
         raise AppError("Wait for the current bill check and cleanup to finish.", 409)
     try:
         with client_factory(access) as client:
-            response = client.call("get_food_cart", {
-                "addressId": current["address_id"],
-            })
+            if hasattr(client, "resume_session"):
+                client.resume_session(current.get("mcp_session"))
+            try:
+                response = client.call("get_food_cart", {"addressId": current["address_id"]})
+            finally:
+                if hasattr(client, "session_info"):
+                    current["mcp_session"] = client.session_info()
         return jsonify(response=redact_diagnostic(response))
     finally:
         cart_lock.release()
