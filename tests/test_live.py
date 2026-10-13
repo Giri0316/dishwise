@@ -232,7 +232,8 @@ class LiveTests(unittest.TestCase):
     def test_failed_reset_stops_before_add(self):
         client=QuoteProvider(clear_fail=True)
         with self.assertRaises(AppError):quote_offer(client,menu_offers({"items":[menu("1")]},1)[0],"addr",True)
-        self.assertEqual(client.names,["flush_food_cart"])
+        self.assertEqual(client.names,["flush_food_cart", "get_food_cart"])
+        self.assertNotIn("update_food_cart", client.names)
     def test_no_code_from_opaque_id(self):
         codes,_=coupon_candidates([{"title":"Best coupon","coupons":[{"id":"opaque-id","title":"20 percent off","applicable":True}]}],True)
         self.assertEqual(codes,[])
