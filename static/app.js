@@ -8,10 +8,10 @@ async function api(path, data) {
   const response = await fetch("/api/" + path, {method:data === undefined ? "GET" : "POST", headers:data === undefined ? {} : {"Content-Type":"application/json","X-CSRF-Token":config.csrf}, body:data === undefined ? undefined : JSON.stringify(data)});
   let result;
   try { result = await response.json(); } catch (_) { throw Error("The server did not return a response. Check your cart before restarting a bill check."); }
-  if (!response.ok) {const error = Error(result.error || "Request failed."); error.safeToContinue = result.safe_to_continue === true; throw error;}
+  if (!response.ok) {const error = Error(result.error || "Request failed."); error.safeToContinue = result.safe_to_continue === true; error.hasDiagnostic = result.diagnostic_url === "/api/debug/cleanup"; throw error;}
   return result;
 }
-function error(message = "") {$("error").textContent = message; $("error").hidden = !message;}
+function error(message = "") {$("error").textContent = message; $("error").hidden = !message; $("error-details").hidden = true;}
 function working(value, message = "") {
   busy = value; document.querySelectorAll("[data-lock]").forEach(el => el.disabled = value);
   $("progress").textContent = message; $("progress").hidden = !message;
@@ -81,7 +81,7 @@ async function compare() {
         offers = offers.map(o => o.id === offer.id ? result.offer : o);
       } catch (e) {
         offer.status = "failed"; offer.bill_error = e.message;
-        if (!e.safeToContinue) {canResume = false; error(e.message); break;}
+        if (!e.safeToContinue) {canResume = false; error(e.message); $("error-details").hidden = !e.hasDiagnostic; break;}
       }
       render();
     }
