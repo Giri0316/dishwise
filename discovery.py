@@ -4,7 +4,7 @@ import os
 import secrets
 import time
 from comparison import data_of, menu_offers
-from matching import exact_dish, query_names
+from matching import dish_count, exact_dish, query_names
 from swiggy import AppError
 
 def _env_int(name, default, low, high):
@@ -23,8 +23,8 @@ MAX_PAGES = max(6, min(int(os.getenv("MAX_DISCOVERY_PAGES", "64")), 64))
 MAX_MENU_PAGES = max(2, min(int(os.getenv("MAX_MENU_PAGES", "20")), 20))
 MAX_METADATA_PAGES = 4
 MAX_LOOKUP_PAGES = 2
-MAX_SECONDS = _env_int("DISCOVERY_SECONDS", 90, 30, 120)
-MENU_SECONDS = _env_int("MENU_SECONDS", 35, 15, 55)
+MAX_SECONDS = _env_int("DISCOVERY_SECONDS", 100, 30, 120)
+MENU_SECONDS = _env_int("MENU_SECONDS", 45, 15, 55)
 
 
 def task_key(task):
@@ -45,7 +45,7 @@ def new_search(dish, quantity, address_id):
            "started_at": time.monotonic(), "phase": "menus", "tasks": [], "scheduled": set(),
            "fingerprints": set(), "restaurants": {}, "raw_offers": {}, "offers": {},
            "candidates": [], "candidate_index": 0, "lookup": None,
-           "bill_diagnostics": {}, "warnings": [], "pages": 0, "menu_pages": 0,
+           "bill_diagnostics": {}, "warnings": [], "rejected_names": [], "excluded": {"far": 0, "closed": 0, "unknown": 0}, "pages": 0, "menu_pages": 0,
            "metadata_pages": 0, "done": False, "partial": False, "busy": False,
            "stop_reason": "", "mcp_session": None}
     for query in query_names(dish):
@@ -122,6 +122,8 @@ def finish(run, reason):
     run["tasks"].clear()
     run["lookup"] = None
     rows = sorted(run["offers"].values(), key=sort_key)[:SHORTLIST_SIZE]
+    if len({row["portion"] for row in rows}) > 1:
+        issue(run, "Portion sizes differ between restaurants (for example 2 pcs vs 3 pcs). Type the exact name with a count, such as 'Idly (2 Pcs)', to compare the same portion.")
     run["offers"] = {row["id"]: {**row, "shortlist_rank": i+1} for i, row in enumerate(rows)}
 
 
@@ -135,8 +137,13 @@ def select_known(run, *, final=False):
             return row
         run["candidate_index"] += 1
         if not known:
+            run["excluded"]["unknown"] += 1
             issue(run, "Some matches lacked confirmed distance or availability and were excluded.")
-        elif info["distance_km"] < 7 and info["availability"] == "OPEN":
+        elif info["distance_km"] >= 7:
+            run["excluded"]["far"] += 1
+        elif info["availability"] != "OPEN":
+            run["excluded"]["closed"] += 1
+        else:
             run["offers"][row["id"]] = {**row, "distance_km": info["distance_km"], "restaurant": info["name"]}
     return None
 
@@ -193,7 +200,14 @@ def step(run, client):
                     restaurant_row(run, row)
             else:
                 for row in menu_offers(data, run["quantity"]):
-                    if exact_dish(row["dish"], run["dish"]):
+                    if not exact_dish(row["dish"], run["dish"]):
+                        # Kept so the screen can show WHY nothing matched.
+                        if row["dish"] not in run["rejected_names"] and len(run["rejected_names"]) < 12:
+                            run["rejected_names"].append(row["dish"])
+                    else:
+                        count = dish_count(row["dish"])
+                        if count and row["portion"] == "Portion size unknown":
+                            row["portion"] = count + " pcs"
                         # A cross-restaurant offset is not a scoped-menu offset.
                         row.update(menu_query=row["dish"], menu_offset=0, needs_menu_detail=True,
                                    match_basis="Exact confirmed recipe with spelling normalization")
@@ -228,6 +242,7 @@ def step(run, client):
         task["offset"] = cursor
         return
     if not known:
+        run["excluded"]["unknown"] += 1
         issue(run, "Some matches lacked confirmed distance or availability and were excluded.")
         run["candidate_index"] += 1
     run["lookup"] = None
@@ -245,5 +260,5 @@ def public_search(run):
             "pending_pages": len(run["tasks"]), "restaurants_seen": len(run["restaurants"]),
             "candidates_found": len(candidates), "restaurants_matched": len(nearby),
             "shortlist_limit": SHORTLIST_SIZE, "shortlisted": len(run["offers"]), "stop_reason": run["stop_reason"],
-            "warnings": run["warnings"], "offers": list(run["offers"].values()) if run["done"] else [],
+            "warnings": run["warnings"], "rejected_samples": run["rejected_names"], "excluded": run["excluded"], "offers": list(run["offers"].values()) if run["done"] else [],
             "scope": f"Up to {SHORTLIST_SIZE} distinct restaurants below 7 km, selected by lowest dish price from the bounded search results. This is not an exhaustive search of all restaurants."}

@@ -61,7 +61,7 @@ class QuoteProvider:
 class LiveTests(unittest.TestCase):
     def test_strict_recipe_matching(self):
         for name in ["Dosa","Dosai","plain DOSAI"]:self.assertTrue(exact_dish(name,"Plain Dosa"))
-        for name in ["Masala Dosa","Ghee Dosa","Onion Dosa","Rava Dosa","Plain Dosa Combo","Plain Dosa 2 pcs","Cheese Dosa"]:self.assertFalse(exact_dish(name,"Plain Dosa"))
+        for name in ["Masala Dosa","Ghee Dosa","Onion Dosa","Rava Dosa","Plain Dosa Combo","Cheese Dosa"]:self.assertFalse(exact_dish(name,"Plain Dosa"))
         self.assertFalse(exact_dish("Chicken Biryani 1 kg","Chicken Biryani"))
     def test_only_known_optional_addons_are_allowed(self):
         self.assertIsNone(customization_reason({"hasAddons":True,"addons":[{"minAddons":0}]}))
@@ -190,6 +190,21 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(result["offer"]["discount"],0)
         self.assertEqual(result["offer"]["coupon_checks"]["failed_codes"],["SAVE20","SAVE30"])
         self.assertIsNone(provider.basket)
+
+    def test_strict_portions_setting_restores_old_rule(self):
+        from unittest.mock import patch
+        self.assertTrue(exact_dish("Plain Dosa 2 pcs","Plain Dosa"))
+        with patch.dict(os.environ,{"STRICT_PORTIONS":"1"}):
+            self.assertFalse(exact_dish("Plain Dosa 2 pcs","Plain Dosa"))
+            self.assertFalse(exact_dish("Idly (2 Pcs)","Idly"))
+            self.assertTrue(exact_dish("Idly (2 Pcs)","Idly (2 Pcs)"))
+
+    def test_piece_counts_are_portions_not_different_recipes(self):
+        for name in ["Idly (2 Pcs)","Idli (3 pcs)","Idly"]:self.assertTrue(exact_dish(name,"Idly"),name)
+        for name in ["Ghee Idly","Idly Sambar","Mini Idly","Idli Vada"]:self.assertFalse(exact_dish(name,"Idly"),name)
+        self.assertTrue(exact_dish("Idly (2 Pcs)","Idly (2 Pcs)"))
+        self.assertFalse(exact_dish("Idli (3 Pcs)","Idly (2 Pcs)"))
+        self.assertFalse(exact_dish("Idly","Idly (2 Pcs)"))
 
     def test_rejected_code_does_not_stop_remaining_codes(self):
         class Provider(QuoteProvider):

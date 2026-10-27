@@ -1,14 +1,24 @@
 """Conservative dish equality. AI never decides final match eligibility."""
 import math
+import os
 import re
 import unicodedata
 
 SPELLINGS = {"dosai": "dosa", "dosha": "dosa", "biriyani": "biryani", "briyani": "biryani", "idly": "idli", "chappathi": "chapati", "chapathi": "chapati"}
 
 
+COUNT = re.compile(r"\(?\b(\d+)\s*(?:pcs?|pieces?|nos?)\b\.?\)?", re.I)
+
+
+def dish_count(name):
+    """Piece count written in a menu name, e.g. 'Idly (2 Pcs)' -> '2', else None."""
+    found = COUNT.search(unicodedata.normalize("NFKC", str(name)))
+    return found.group(1) if found else None
+
+
 def dish_key(name):
-    tokens = re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", str(name)).casefold())
-    tokens = [SPELLINGS.get(token, token) for token in tokens]
+    text = COUNT.sub(" ", unicodedata.normalize("NFKC", str(name))).casefold()
+    tokens = [SPELLINGS.get(token, token) for token in re.findall(r"[^\W_]+", text)]
     # A bare dosa and Plain Dosa are the only implicit recipe equivalence.
     if tokens in (["dosa"], ["plain", "dosa"]):
         return "plain dosa"
@@ -16,7 +26,16 @@ def dish_key(name):
 
 
 def exact_dish(name, confirmed):
-    return bool(dish_key(confirmed)) and dish_key(name) == dish_key(confirmed)
+    """Same recipe. A piece count in the confirmed name must match exactly;
+    without one, any piece count of the same recipe matches (shown as its portion)."""
+    if not dish_key(confirmed) or dish_key(name) != dish_key(confirmed):
+        return False
+    wanted = dish_count(confirmed)
+    # STRICT_PORTIONS=1 restores the old rule: counts must always be equal, so
+    # "Idly" never matches "Idly (2 Pcs)".
+    if os.getenv("STRICT_PORTIONS") == "1":
+        return dish_count(name) == wanted
+    return wanted is None or dish_count(name) == wanted
 
 
 def query_names(confirmed):

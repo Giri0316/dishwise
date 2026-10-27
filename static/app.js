@@ -32,7 +32,7 @@ function render() {
   }).join("") : '<div class="empty"><h3>Compare the same dish.</h3><p>We’ll confirm the exact name before searching nearby menus.</p></div>';
   if (run) {
     $("coverage").hidden = false;
-    $("coverage").textContent = `${run.pages_checked}/${run.page_limit || 64} discovery pages · ${run.candidates_found ?? run.restaurants_matched} exact restaurant matches collected · ${run.shortlisted ?? offers.length}/${run.shortlist_limit ?? 40} selected.\n${run.done ? "Dish-price shortlist ready. " : "Collecting a bounded candidate pool. "}${(run.warnings || []).join(" ")}`;
+    $("coverage").textContent = `${run.pages_checked}/${run.page_limit || 64} discovery pages · ${run.candidates_found ?? run.restaurants_matched} exact restaurant matches collected · ${run.shortlisted ?? offers.length}/${run.shortlist_limit ?? 40} selected.\n${run.done ? "Dish-price shortlist ready. " : "Collecting a bounded candidate pool. "}${(run.warnings || []).join(" ")}${run.done && !offers.length ? `\nMatches excluded: ${run.excluded?.far ?? 0} too far (7 km or more), ${run.excluded?.closed ?? 0} closed, ${run.excluded?.unknown ?? 0} with unknown distance.${(run.rejected_samples || []).length ? `\nMenu names Swiggy returned that did not match "${selectedDish}": ${run.rejected_samples.join("; ")}.` : ""}` : ""}`;
     $("footnote").textContent = `${quoted.length} of ${offers.length} shortlisted restaurants have full bills; ${confirmed.length} completed coupon verification. ${run.scope || ""} Failed bills and incomplete coupon checks are excluded from ranking.`;
   }
 }

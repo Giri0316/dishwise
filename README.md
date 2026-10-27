@@ -134,3 +134,6 @@ this app must preserve the session being cleaned up.
 - **Cards without a code and without `applicable: true` no longer make a check incomplete.**
 - **One fewer cart read per coupon tried** (3 calls per code became 2).
 - **Payment offers**: Swiggy MCP only quotes cash on delivery, so bank/UPI offers cannot be applied or verified. Any payment offers Swiggy does list are now shown in the bill dialog as information, not included in totals.
+
+- **Piece counts are portions, not different recipes.** Searching "Idly" now matches "Idly (2 Pcs)" and "Idli (3 Pcs)" (spelling Idly/Idli is already normalised); the count is shown as the portion and a warning appears if sizes differ. Typing "Idly (2 Pcs)" requires exactly 2 pcs. Fillings, ghee, mini, combos and sambar variants still do not match. Set `STRICT_PORTIONS=1` in Render to restore the old rule where a count never matches a bare name.
+- **When nothing matches, the screen now says why**: how many matches were too far, closed or had unknown distance, and sample menu names Swiggy returned that were rejected.
