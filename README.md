@@ -125,3 +125,12 @@ this app must preserve the session being cleaned up.
 - https://github.com/HKTITAN/swiggy-cli/blob/main/src/lib/mcp.ts
 - https://github.com/HKTITAN/swiggy-cli/blob/main/src/commands/food.ts
 - https://github.com/Atishyy27/swiggy-mcp-toy/blob/main/src/agent.mjs
+
+## Speed and coupon fixes — 2026-10-27
+
+- **Shortlist is now 12 by default** (was 40). Each restaurant needs a full cart check, so this is the biggest driver of waiting time. Set `SHORTLIST_SIZE` (3–40) in Render → Environment to change it. `DISCOVERY_SECONDS` (default 90) and `MENU_SECONDS` (default 35) also tune discovery.
+- **Discovery runs several Swiggy calls per browser request** (about 6 seconds' worth) instead of one, removing a connection and round trip per page. Gunicorn now has `--timeout 120`.
+- **One Swiggy-rejected coupon no longer stops the others.** An explicit "could not apply" answer is treated as a normal result; remaining codes are still tested. Previously the first rejected code ended testing and marked the restaurant "Coupon verification incomplete".
+- **Cards without a code and without `applicable: true` no longer make a check incomplete.**
+- **One fewer cart read per coupon tried** (3 calls per code became 2).
+- **Payment offers**: Swiggy MCP only quotes cash on delivery, so bank/UPI offers cannot be applied or verified. Any payment offers Swiggy does list are now shown in the bill dialog as information, not included in totals.

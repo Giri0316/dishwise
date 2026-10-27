@@ -21,7 +21,7 @@ function render() {
   const confirmed = offers.filter(o => o.status === "verified");
   const quoted = offers.filter(o => o.status === "verified" || o.status === "coupon_unverified");
   $("results-title").textContent = busy ? "Comparing your exact dish" : "Your comparison";
-  $("results-summary").textContent = selectedDish ? `${requestedQuantity} × ${selectedDish} · Below 7 km · ${new Set(offers.map(o => o.restaurant_id)).size} of up to 40 shortlisted restaurants` : "Connect Swiggy, then choose your dish and address.";
+  $("results-summary").textContent = selectedDish ? `${requestedQuantity} × ${selectedDish} · Below 7 km · ${new Set(offers.map(o => o.restaurant_id)).size} of up to ${run?.shortlist_limit ?? 40} shortlisted restaurants` : "Connect Swiggy, then choose your dish and address.";
   offers.sort((a,b) => (a.status === "verified" ? 0 : 1) - (b.status === "verified" ? 0 : 1) || (a.total ?? a.item_total ?? Infinity) - (b.total ?? b.item_total ?? Infinity));
   $("results").innerHTML = offers.length ? offers.map((o,i) => {
     const verified = o.status === "verified";
@@ -32,7 +32,7 @@ function render() {
   }).join("") : '<div class="empty"><h3>Compare the same dish.</h3><p>We’ll confirm the exact name before searching nearby menus.</p></div>';
   if (run) {
     $("coverage").hidden = false;
-    $("coverage").textContent = `${run.pages_checked}/${run.page_limit || 64} discovery pages · ${run.candidates_found ?? run.restaurants_matched} exact restaurant matches collected · ${run.shortlisted ?? offers.length}/40 selected.\n${run.done ? "Dish-price shortlist ready. " : "Collecting a bounded candidate pool. "}${(run.warnings || []).join(" ")}`;
+    $("coverage").textContent = `${run.pages_checked}/${run.page_limit || 64} discovery pages · ${run.candidates_found ?? run.restaurants_matched} exact restaurant matches collected · ${run.shortlisted ?? offers.length}/${run.shortlist_limit ?? 40} selected.\n${run.done ? "Dish-price shortlist ready. " : "Collecting a bounded candidate pool. "}${(run.warnings || []).join(" ")}`;
     $("footnote").textContent = `${quoted.length} of ${offers.length} shortlisted restaurants have full bills; ${confirmed.length} completed coupon verification. ${run.scope || ""} Failed bills and incomplete coupon checks are excluded from ranking.`;
   }
 }
@@ -120,7 +120,7 @@ async function savedAddresses() {
 }
 function bill(index) {
   const o = offers[index];
-  $("bill-content").innerHTML = `<h3>${esc(o.restaurant)}</h3><p>${o.quantity} × ${esc(o.dish)} · ${esc(o.distance_km)} km</p>${[["Items",o.item_total],["Delivery",o.delivery],["GST & other charges",o.other_charges],["Confirmed coupon savings",o.discount]].map(([label,n])=>`<div class="bill-row"><span>${label}</span><span>${money(n)}</span></div>`).join("")}<div class="bill-row total"><span>MCP quoted total</span><span>${money(o.total)}</span></div><p>${esc(o.coupon_note)}</p><p class="muted">Returned by Swiggy MCP. Mobile checkout may differ. Prices can change.</p>`;$("bill-dialog").showModal();
+  $("bill-content").innerHTML = `<h3>${esc(o.restaurant)}</h3><p>${o.quantity} × ${esc(o.dish)} · ${esc(o.distance_km)} km</p>${[["Items",o.item_total],["Delivery",o.delivery],["GST & other charges",o.other_charges],["Confirmed coupon savings",o.discount]].map(([label,n])=>`<div class="bill-row"><span>${label}</span><span>${money(n)}</span></div>`).join("")}<div class="bill-row total"><span>MCP quoted total</span><span>${money(o.total)}</span></div><p>${esc(o.coupon_note)}</p>${(o.payment_offers||[]).length ? `<h4>Payment offers Swiggy listed (not applied)</h4><ul>${o.payment_offers.map(p => `<li>${esc([p.title,p.subtitle,p.description].filter(Boolean).join(" — "))}</li>`).join("")}</ul><p class="muted">These need online payment. Swiggy MCP quotes are cash-on-delivery, so they are not included in the total.</p>` : `<p class="muted">Bank/UPI payment offers: none were returned by Swiggy for this cart.</p>`}<p class="muted">Returned by Swiggy MCP. Mobile checkout may differ. Prices can change.</p>`;$("bill-dialog").showModal();
 }
 document.querySelectorAll("[data-close]").forEach(button => button.onclick = () => $(button.dataset.close).close());
 $("search-form").onsubmit = startSearch;$("confirm-dish").onclick = confirmDish;$("connect").onclick = connect;$("choose-location").onclick = openAddresses;$("more-addresses").onclick = savedAddresses;$("resume").onclick = resume;

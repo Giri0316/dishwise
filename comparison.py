@@ -338,7 +338,7 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
                  for c in (section.get("coupons") if isinstance(section.get("coupons"), list) else []) if isinstance(c, dict)]
         plan = coupon_plan(sections, (cart.get("offers") or {}).get("coupon_applied"))
         candidates, best_section_found = plan["codes"], plan["best_section"]
-        checked, confirmed_codes = [], []
+        checked, confirmed_codes, rejected_codes = [], [], []
         stopped_early = False
         application_failed = False
         for code in candidates:
@@ -347,8 +347,8 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
             if getattr(client, "calls", 0) + 6 > 36:
                 stopped_early = True
                 break
-            cart = parse_cart(client.call("get_food_cart", cart_args))
-            require_exact(cart, offer)
+            # `cart` is already the latest verified read (initial bill, or the
+            # read taken after the previous attempt), so no extra read is needed.
             apply_error = None
             try:
                 client.call("apply_food_coupon", {"addressId": address_id, "couponCode": code,
@@ -364,13 +364,23 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
             checked.append(code)
             if bill["coupon"] == code and bill["discount"] > 0:
                 confirmed_codes.append(code)
+            elif apply_error is not None and apply_error.code in ("tool_failed", "tool_error"):
+                # Swiggy explicitly declined this code for this cart (minimum
+                # order, user eligibility, ...) and the cart was re-read and
+                # verified. That is a normal, fully checked outcome and must not
+                # make the whole restaurant "incomplete".
+                rejected_codes.append(code)
             else:
+                # Reported success but the cart shows no discount: uncertain.
                 application_failed = True
             if bill["coupon"] == code and (bill["discount"], -bill["total"]) > (best["discount"], -best["total"]):
                 best = bill
                 best_cart = deepcopy(cart)
-            if apply_error is not None:
-                # Preserve the verified bill and stop after an uncertain call.
+            if apply_error is not None and apply_error.code not in ("tool_failed", "tool_error"):
+                # Transport or format trouble leaves the outcome uncertain: stop.
+                # A clean "Swiggy rejected this coupon" answer is not uncertain,
+                # because the cart was just re-read and verified, so the next
+                # code can still be tested.
                 stopped_early = True
                 break
         coupon_complete = not (coupon_warning or stopped_early or plan["unresolved_cards"] or application_failed)
@@ -387,7 +397,9 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
             "complete": coupon_complete,
             "unresolved_cards": plan["unresolved_cards"],
             "failed_codes": [code for code in checked if code not in confirmed_codes],
+            "rejected_codes": rejected_codes,
         }
+        best["payment_offers"] = plan["payment_offers"]
         if best.get("coupon") and best["discount"] > 0:
             best["coupon_note"] = (
                 f"{best['coupon']} confirmed: Rs {best['discount']:.2f} off. "
@@ -406,8 +418,8 @@ def quote_offer(client, offer, address_id, replace_existing_cart=False):
             best["coupon_note"] += " No usable eligible coupon codes were returned."
         if plan["unresolved_cards"]:
             best["coupon_note"] += f" {plan['unresolved_cards']} coupon cards did not expose a usable code."
-        if application_failed:
-            best["coupon_note"] += " Swiggy did not confirm positive savings for every attempted code."
+        if rejected_codes:
+            best["coupon_note"] += f" Swiggy did not accept {len(rejected_codes)} of {len(checked)} listed codes for this cart ({', '.join(rejected_codes[:4])})."
         if not coupon_complete:
             best["coupon_note"] += " Coupon verification is incomplete; this bill is excluded from the lowest-price ranking."
         if not best["coupon_checks"]["all_candidates_tested"]:

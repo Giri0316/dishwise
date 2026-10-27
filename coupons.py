@@ -34,6 +34,7 @@ def coupon_plan(sections, suggested=None):
     ordered = sorted(sections, key=lambda s: not is_best(s))
     codes, unavailable_codes = [], set()
     unresolved, eligible_cards = 0, 0
+    payment_offers = []
     for section in ordered:
         cards = section.get("coupons")
         for card in cards if isinstance(cards, list) else []:
@@ -41,7 +42,12 @@ def coupon_plan(sections, suggested=None):
                 continue
             code = code_of(card)
             status = str(card.get("applicabilityStatus", "")).upper()
-            if card.get("applicable") is False or status == "NOT_APPLICABLE" or payment_only(section, card):
+            is_payment = payment_only(section, card)
+            if is_payment and card.get("applicable") is not False and len(payment_offers) < 8:
+                # Shown for information only. Swiggy MCP quotes are cash-on-delivery,
+                # so these cannot be applied or verified here.
+                payment_offers.append({k: card.get(k) for k in ("title", "subtitle", "description") if card.get(k)})
+            if card.get("applicable") is False or status == "NOT_APPLICABLE" or is_payment:
                 if code:
                     unavailable_codes.add(code)
                 continue
@@ -51,12 +57,17 @@ def coupon_plan(sections, suggested=None):
             if code:
                 if code not in codes:
                     codes.append(code)
-            else:
+            elif card.get("applicable") is True:
+                # Only a card Swiggy says IS applicable but gives no usable code
+                # makes the check incomplete. Cards with no code and no applicable
+                # flag (banners, item promos) cannot be applied, so they are not
+                # a reason to discard an otherwise complete check.
                 unresolved += 1
     if isinstance(suggested, str) and suggested.strip() and suggested not in unavailable_codes and suggested not in codes:
         codes.insert(0, suggested.strip())
     return {"codes": codes, "best_section": any(is_best(s) for s in sections),
-            "unresolved_cards": unresolved, "eligible_cards": eligible_cards}
+            "unresolved_cards": unresolved, "eligible_cards": eligible_cards,
+            "payment_offers": payment_offers}
 
 
 def coupon_candidates(sections, cod_filtered=True):

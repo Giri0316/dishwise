@@ -7,14 +7,24 @@ from comparison import data_of, menu_offers
 from matching import exact_dish, query_names
 from swiggy import AppError
 
-SHORTLIST_SIZE = 40
+def _env_int(name, default, low, high):
+    try:
+        return max(low, min(int(os.getenv(name, str(default))), high))
+    except ValueError:
+        return default
+
+
+# Each shortlisted restaurant costs a full cart check (about 10-30 Swiggy calls),
+# so this number is the main driver of total waiting time. Raise it on Render
+# with SHORTLIST_SIZE=20 (max 40) if you want wider coverage and accept a slower run.
+SHORTLIST_SIZE = _env_int("SHORTLIST_SIZE", 12, 3, 40)
 # Hard ceilings override an old MAX_DISCOVERY_PAGES=2000 deployment setting.
 MAX_PAGES = max(6, min(int(os.getenv("MAX_DISCOVERY_PAGES", "64")), 64))
 MAX_MENU_PAGES = max(2, min(int(os.getenv("MAX_MENU_PAGES", "20")), 20))
 MAX_METADATA_PAGES = 4
 MAX_LOOKUP_PAGES = 2
-MAX_SECONDS = 120
-MENU_SECONDS = 55
+MAX_SECONDS = _env_int("DISCOVERY_SECONDS", 90, 30, 120)
+MENU_SECONDS = _env_int("MENU_SECONDS", 35, 15, 55)
 
 
 def task_key(task):
@@ -236,4 +246,4 @@ def public_search(run):
             "candidates_found": len(candidates), "restaurants_matched": len(nearby),
             "shortlist_limit": SHORTLIST_SIZE, "shortlisted": len(run["offers"]), "stop_reason": run["stop_reason"],
             "warnings": run["warnings"], "offers": list(run["offers"].values()) if run["done"] else [],
-            "scope": "Up to 40 distinct restaurants below 7 km, selected by lowest dish price from the bounded search results. This is not an exhaustive search of all restaurants."}
+            "scope": f"Up to {SHORTLIST_SIZE} distinct restaurants below 7 km, selected by lowest dish price from the bounded search results. This is not an exhaustive search of all restaurants."}

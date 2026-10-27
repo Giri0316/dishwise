@@ -277,7 +277,13 @@ def search_next():
             if hasattr(client, "resume_session"):
                 client.resume_session(current.get("mcp_session"))
             try:
+                # Several sequential Swiggy calls per browser request: one call per
+                # request meant a new connection and a full round trip for every
+                # single page. The cap keeps the request well under the worker timeout.
+                until = time.monotonic() + 6
                 discovery_step(current, client)
+                while not current["done"] and time.monotonic() < until:
+                    discovery_step(current, client)
             finally:
                 if hasattr(client, "session_info"):
                     current["mcp_session"] = client.session_info()

@@ -1,3 +1,5 @@
+import os
+os.environ.setdefault("SHORTLIST_SIZE","40")
 import copy
 import os
 import sys
@@ -9,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from matching import exact_dish, customization_reason
 from discovery import new_search, step
 from comparison import menu_offers, quote_offer, coupon_candidates
+from coupons import coupon_plan
 from swiggy import AppError
 
 
@@ -187,6 +190,31 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(result["offer"]["discount"],0)
         self.assertEqual(result["offer"]["coupon_checks"]["failed_codes"],["SAVE20","SAVE30"])
         self.assertIsNone(provider.basket)
+
+    def test_rejected_code_does_not_stop_remaining_codes(self):
+        class Provider(QuoteProvider):
+            def call(self,name,args):
+                if name=="apply_food_coupon" and args["couponCode"]=="SAVE20":
+                    self.calls+=1;self.names.append(name)
+                    raise AppError("Swiggy could not complete apply_food_coupon.",502,code="tool_failed")
+                return super().call(name,args)
+        provider=Provider()
+        result=quote_offer(provider,menu_offers({"items":[menu("1")]},1)[0],"addr",True)
+        offer=result["offer"]
+        self.assertEqual(offer["status"],"verified")
+        self.assertEqual(offer["coupon"],"SAVE30")
+        self.assertEqual(offer["discount"],30)
+        self.assertEqual(offer["coupon_checks"]["rejected_codes"],["SAVE20"])
+        self.assertTrue(offer["coupon_checks"]["all_candidates_tested"])
+        self.assertIsNone(provider.basket)
+
+    def test_payment_offers_are_listed_but_never_applied(self):
+        sections=[{"title":"Payment offers","coupons":[{"title":"10% off with HDFC","description":"Valid on credit card","applicable":True}]},
+                  {"title":"More offers","coupons":[{"title":"SAVE20","applicable":True},{"title":"Banner promo"}]}]
+        plan=coupon_plan(sections)
+        self.assertEqual(plan["codes"],["SAVE20"])
+        self.assertEqual(len(plan["payment_offers"]),1)
+        self.assertEqual(plan["unresolved_cards"],0)
 
     def test_payment_and_ineligible_codes_are_excluded(self):
         sections=[{"title":"Best coupon","coupons":[{"code":"YES20","applicable":True},{"code":"NO30","applicable":False},{"code":"BANK40","applicable":True,"description":"Use a credit card"}]},{"title":"Payment offers","coupons":[{"code":"PAY50","applicable":True}]}]
