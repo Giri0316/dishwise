@@ -4,7 +4,7 @@ import os
 import secrets
 import time
 from comparison import data_of, menu_offers
-from matching import dish_count, exact_dish, query_names
+from matching import exact_dish, query_names
 from swiggy import AppError
 
 def _env_int(name, default, low, high):
@@ -205,9 +205,6 @@ def step(run, client):
                         if row["dish"] not in run["rejected_names"] and len(run["rejected_names"]) < 12:
                             run["rejected_names"].append(row["dish"])
                     else:
-                        count = dish_count(row["dish"])
-                        if count and row["portion"] == "Portion size unknown":
-                            row["portion"] = count + " pcs"
                         # A cross-restaurant offset is not a scoped-menu offset.
                         row.update(menu_query=row["dish"], menu_offset=0, needs_menu_detail=True,
                                    match_basis="Exact confirmed recipe with spelling normalization")

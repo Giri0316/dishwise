@@ -3,7 +3,7 @@ import math
 import re
 from copy import deepcopy
 from swiggy import AppError
-from matching import customization_reason, exact_dish
+from matching import customization_reason, dish_count, exact_dish
 from coupons import coupon_plan, coupon_candidates
 
 
@@ -241,7 +241,7 @@ def menu_offers(payload, quantity, restaurant_id=None, restaurant_name=None):
         results[identifier] = {"id": identifier, "item_id": str(item["menu_item_id"]),
             "restaurant_id": str(resolved_restaurant_id), "restaurant": str(item.get("restaurant_name") or restaurant_name or "Swiggy restaurant"),
             "dish": str(item.get("name") or "Menu item"), "quantity": quantity,
-            "portion": str(item.get("portion_size") or "Portion size unknown"),
+            "portion": str(item.get("portion_size") or (f"{dish_count(item.get('name'))} pcs" if dish_count(item.get("name")) else "Portion size unknown")),
             "unit_price": price, "item_total": round(price * quantity, 2) if price is not None else None,
             "delivery": None, "other_charges": None, "discount": 0, "coupon": None, "total": None,
             "status": "estimate", "rating": str(item.get("rating") or ""),

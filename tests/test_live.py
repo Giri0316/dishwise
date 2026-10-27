@@ -12,6 +12,7 @@ from matching import exact_dish, customization_reason
 from discovery import new_search, step
 from comparison import menu_offers, quote_offer, coupon_candidates
 from coupons import coupon_plan
+from swiggy import RateGate
 from swiggy import AppError
 
 
@@ -205,6 +206,24 @@ class LiveTests(unittest.TestCase):
         self.assertTrue(exact_dish("Idly (2 Pcs)","Idly (2 Pcs)"))
         self.assertFalse(exact_dish("Idli (3 Pcs)","Idly (2 Pcs)"))
         self.assertFalse(exact_dish("Idly","Idly (2 Pcs)"))
+
+    def test_rate_gate_spaces_calls_and_limits_writes(self):
+        t=[0.0]; slept=[]
+        def sleep(x): slept.append(x); t[0]+=x
+        gate=RateGate(5,2,clock=lambda:t[0],sleep=sleep)
+        for _ in range(5): gate.wait("u")
+        self.assertEqual(slept,[])
+        gate.wait("u")                      # 6th call in a minute must wait for the window
+        self.assertGreaterEqual(sum(slept),59)
+        slept.clear(); t[0]+=120
+        gate.wait("w",True);gate.wait("w",True)
+        gate.wait("w",True)                 # 3rd write must wait
+        self.assertGreaterEqual(sum(slept),59)
+        slept.clear(); gate.wait("other"); self.assertEqual(slept,[])   # separate user unaffected
+
+    def test_piece_count_is_shown_as_portion(self):
+        row=menu_offers({"items":[{**menu("1","Plain Dosai (2 Pcs)")}]},1)[0]
+        self.assertEqual(row["portion"],"2 pcs")
 
     def test_rejected_code_does_not_stop_remaining_codes(self):
         class Provider(QuoteProvider):

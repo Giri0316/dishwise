@@ -137,3 +137,7 @@ this app must preserve the session being cleaned up.
 
 - **Piece counts are portions, not different recipes.** Searching "Idly" now matches "Idly (2 Pcs)" and "Idli (3 Pcs)" (spelling Idly/Idli is already normalised); the count is shown as the portion and a warning appears if sizes differ. Typing "Idly (2 Pcs)" requires exactly 2 pcs. Fillings, ghee, mini, combos and sambar variants still do not match. Set `STRICT_PORTIONS=1` in Render to restore the old rule where a count never matches a bare name.
 - **When nothing matches, the screen now says why**: how many matches were too far, closed or had unknown distance, and sample menu names Swiggy returned that were rejected.
+
+## Rate limiter — 2026-10-27
+
+A live run stopped after about 7 restaurants with "Swiggy is limiting requests", and the cart-clearing call was among the blocked ones. Swiggy's published planned limits are 120 requests/min per user and 30 write requests/min (add to cart, apply coupon, clear cart). The app now waits as needed to stay below them: `SWIGGY_REQUESTS_PER_MIN` (default 70) and `SWIGGY_WRITES_PER_MIN` (default 20). This makes full runs steadier but not instant. Piece counts such as "2 pcs" are now also shown as the portion after the bill check.

@@ -1,6 +1,9 @@
 """Small, bounded MCP client. Credentials stay in Python process memory."""
 import json
+import os
+import threading
 import time
+from collections import defaultdict, deque
 import httpx
 from email.utils import parsedate_to_datetime
 
@@ -9,6 +12,54 @@ ALLOWED_TOOLS = frozenset({
     "get_addresses", "create_address", "search_menu", "search_restaurants", "get_food_cart",
     "update_food_cart", "fetch_food_coupons", "apply_food_coupon", "flush_food_cart",
 })
+
+
+WRITE_TOOLS = frozenset({"update_food_cart", "apply_food_coupon", "flush_food_cart", "create_address"})
+
+
+class RateGate:
+    """Keeps this app under Swiggy's per-user limits (planned: 120 requests/min,
+    30 write requests/min). Waiting here is cheaper than a 429, which can also
+    block the cart cleanup call and stop the whole comparison."""
+
+    def __init__(self, per_minute, writes_per_minute, clock=time.monotonic, sleep=time.sleep):
+        self.per_minute, self.writes_per_minute = per_minute, writes_per_minute
+        self.clock, self.sleep = clock, sleep
+        self.lock = threading.Lock()
+        self.calls, self.writes = defaultdict(deque), defaultdict(deque)
+
+    def wait(self, key, write=False):
+        waited = 0.0
+        while True:
+            with self.lock:
+                now = self.clock()
+                for queue in (self.calls[key], self.writes[key]):
+                    while queue and now - queue[0] >= 60:
+                        queue.popleft()
+                delay = 0.0
+                if len(self.calls[key]) >= self.per_minute:
+                    delay = self.calls[key][0] + 60 - now
+                if write and len(self.writes[key]) >= self.writes_per_minute:
+                    delay = max(delay, self.writes[key][0] + 60 - now)
+                if delay <= 0:
+                    self.calls[key].append(now)
+                    if write:
+                        self.writes[key].append(now)
+                    return waited
+            pause = min(max(delay, .05), 5)
+            self.sleep(pause)
+            waited += pause
+
+
+def _limit(name, default):
+    try:
+        return max(5, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+# Defaults sit well under Swiggy's planned ceilings (120 / 30 per minute).
+GATE = RateGate(_limit("SWIGGY_REQUESTS_PER_MIN", 70), _limit("SWIGGY_WRITES_PER_MIN", 20))
 
 
 class AppError(Exception):
@@ -62,6 +113,7 @@ def auth_post(path, body=None, token=None):
 
 class SwiggyClient:
     def __init__(self, token, transport=None):
+        self.gate_key = hash(token)
         self.client = httpx.Client(
             timeout=httpx.Timeout(25, connect=10), follow_redirects=False,
             transport=transport,
@@ -208,6 +260,7 @@ class SwiggyClient:
             self.client.headers["MCP-Protocol-Version"] = init["protocolVersion"]
             self.rpc("notifications/initialized", {}, notification=True)
             self.started = True
+        GATE.wait(self.gate_key, name in WRITE_TOOLS)
         result = self.rpc("tools/call", {"name": name, "arguments": arguments})
         if not isinstance(result, dict) or result.get("isError"):
             raise AppError(f"Swiggy could not complete {name}.", 502, code="tool_error")
